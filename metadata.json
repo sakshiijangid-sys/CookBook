@@ -1,0 +1,8 @@
+{
+  "name": "Remix: Recipe Book \u0026 Planner",
+  "description": "An elegant, full-stack Recipe Book and Meal Planner that uses a React frontend and an Express + MongoDB style custom API with embedded arrays for managing ingredients and instructions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
