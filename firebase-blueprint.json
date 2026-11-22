@@ -1,0 +1,233 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Private user workspace preferences and hidden catalog recipe IDs (strictly owner-only, zero PII).",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "currency": {
+          "type": "string",
+          "enum": ["USD", "EUR", "GBP", "JPY", "INR", "CAD", "AUD"],
+          "maxLength": 10
+        },
+        "hiddenRecipeIds": {
+          "type": "array",
+          "description": "Bounded list of catalog recipe IDs hidden by the user (max 500)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "currency", "hiddenRecipeIds", "createdAt", "updatedAt"]
+    },
+    "MealPlanEntry": {
+      "title": "MealPlanEntry",
+      "description": "A single day's scheduled breakfast, lunch, and dinner recipe IDs for a user.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "day": {
+          "type": "string",
+          "enum": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+          "maxLength": 16
+        },
+        "breakfast": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]*$"
+        },
+        "lunch": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]*$"
+        },
+        "dinner": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]*$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "day", "createdAt", "updatedAt"]
+    },
+    "GroceryItemState": {
+      "title": "GroceryItemState",
+      "description": "User grocery list item quantity and checked state (no client-trusted prices).",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "itemKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "amount": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "unit": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "checked": {
+          "type": "boolean"
+        },
+        "isCustom": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "itemKey", "name", "amount", "unit", "checked", "isCustom", "createdAt", "updatedAt"]
+    },
+    "NutriScanRecord": {
+      "title": "NutriScanRecord",
+      "description": "Saved NutriCare nutritional analysis record for a user.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "mealName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "isFruitOrVegetable": {
+          "type": "boolean"
+        },
+        "calories": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "carbohydrates": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "proteins": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "fats": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "vitamins": {
+          "type": "array",
+          "description": "Key vitamins (max 15)."
+        },
+        "minerals": {
+          "type": "array",
+          "description": "Key minerals (max 15)."
+        },
+        "healthScore": {
+          "type": "number",
+          "description": "Numeric health score between 0 and 100."
+        },
+        "isUnhealthy": {
+          "type": "boolean"
+        },
+        "unhealthyExplanation": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "healthyAlternatives": {
+          "type": "array",
+          "description": "Suggested healthy alternatives (max 10)."
+        },
+        "funFact": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "query",
+        "mealName",
+        "isFruitOrVegetable",
+        "calories",
+        "carbohydrates",
+        "proteins",
+        "fats",
+        "vitamins",
+        "minerals",
+        "healthScore",
+        "isUnhealthy",
+        "unhealthyExplanation",
+        "healthyAlternatives",
+        "funFact",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User workspace preferences and hidden catalog IDs."
+    },
+    "/users/{userId}/mealPlans/{day}": {
+      "schema": { "$ref": "#/entities/MealPlanEntry" },
+      "description": "Per-day weekly meal plan assignments owned by the user."
+    },
+    "/users/{userId}/groceryItems/{itemId}": {
+      "schema": { "$ref": "#/entities/GroceryItemState" },
+      "description": "User grocery checklist and quantity overrides (prices never stored from client)."
+    },
+    "/users/{userId}/nutriScans/{scanId}": {
+      "schema": { "$ref": "#/entities/NutriScanRecord" },
+      "description": "Cached NutriCare AI scan results and user search history."
+    }
+  }
+}

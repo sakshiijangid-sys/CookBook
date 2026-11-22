@@ -1,212 +1,182 @@
-import React, { useState, useEffect } from 'react';
-import { Recipe, MealPlan } from './types';
+import React, { useEffect, useMemo, useState } from 'react';
+import { CURATED_RECIPES, DEFAULT_MEAL_PLANS } from './data/recipesCatalog';
+import {
+  DayOfWeek,
+  GroceryItemRecord,
+  MealPlan,
+  NutriScanRecord,
+  NutritionData,
+  Recipe,
+} from './types';
 import { CurrencyType, FALLBACK_RATES } from './utils/currency';
 import RecipeCard from './components/RecipeCard';
-import { AnimatePresence } from 'motion/react';
 import RecipeDetailsModal from './components/RecipeDetailsModal';
 import MealPlannerView from './components/MealPlannerView';
-import ShoppingListView from './components/ShoppingListView';
+import ShoppingListView, { PriceState } from './components/ShoppingListView';
 import NutriCareView from './components/NutriCareView';
-import SkeletonLoader from './components/SkeletonLoader';
-import { 
-  BookOpen, 
-  Calendar, 
-  ShoppingBag, 
-  Plus, 
-  Search, 
-  ChefHat, 
-  Loader2, 
-  Utensils, 
-  Info, 
-  ChevronRight,
-  Sparkles,
+import {
+  BookOpen,
+  Calendar,
+  ShoppingBag,
+  Search,
+  ChefHat,
+  Utensils,
   Heart,
-  Database,
-  Download,
-  Upload,
-  AlertCircle,
-  CheckCircle,
-  FileJson,
-  X,
-  Copy
+  RotateCcw,
 } from 'lucide-react';
 
+function makeSafeDocId(prefix: string, rawKey: string): string {
+  let h = 2166136261;
+  const normalized = rawKey.toLowerCase().trim();
+  for (let i = 0; i < normalized.length; i++) {
+    h ^= normalized.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  const safePrefix = prefix.replace(/[^a-zA-Z0-9_\-]/g, '').slice(0, 20) || 'doc';
+  const slug = normalized
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64);
+  const suffix = (h >>> 0).toString(16);
+  const combined = slug ? `${safePrefix}_${slug}_${suffix}` : `${safePrefix}_${suffix}`;
+  return combined.slice(0, 128);
+}
+
+const WORKSPACE_STORAGE_KEY = 'cookbook_workspace_v1';
+const VALID_CURRENCIES: CurrencyType[] = ['USD', 'EUR', 'GBP', 'JPY', 'INR', 'CAD', 'AUD'];
+const VALID_DAYS: DayOfWeek[] = [
+  'Monday',
+  'Tuesday',
+  'Wednesday',
+  'Thursday',
+  'Friday',
+  'Saturday',
+  'Sunday',
+];
+
+interface PersistedWorkspace {
+  currency: CurrencyType;
+  hiddenRecipeIds: string[];
+  mealPlans: MealPlan[];
+  groceryRecords: Record<string, GroceryItemRecord>;
+  nutriScans: NutriScanRecord[];
+}
+
+function loadWorkspaceFromStorage(): PersistedWorkspace {
+  const defaults: PersistedWorkspace = {
+    currency: 'USD',
+    hiddenRecipeIds: [],
+    mealPlans: DEFAULT_MEAL_PLANS,
+    groceryRecords: {},
+    nutriScans: [],
+  };
+
+  try {
+    const raw = window.localStorage.getItem(WORKSPACE_STORAGE_KEY);
+    if (!raw) return defaults;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return defaults;
+
+    const currency = VALID_CURRENCIES.includes(parsed.currency)
+      ? (parsed.currency as CurrencyType)
+      : 'USD';
+
+    const hiddenRecipeIds = Array.isArray(parsed.hiddenRecipeIds)
+      ? parsed.hiddenRecipeIds.filter((id: unknown): id is string => typeof id === 'string').slice(0, 500)
+      : [];
+
+    const mealPlans: MealPlan[] = Array.isArray(parsed.mealPlans)
+      ? parsed.mealPlans
+          .filter((p: any) => p && VALID_DAYS.includes(p.day))
+          .map((p: any) => ({
+            day: p.day as DayOfWeek,
+            breakfast: typeof p.breakfast === 'string' && p.breakfast ? p.breakfast : undefined,
+            lunch: typeof p.lunch === 'string' && p.lunch ? p.lunch : undefined,
+            dinner: typeof p.dinner === 'string' && p.dinner ? p.dinner : undefined,
+          }))
+      : DEFAULT_MEAL_PLANS;
+
+    const groceryRecords: Record<string, GroceryItemRecord> = {};
+    if (parsed.groceryRecords && typeof parsed.groceryRecords === 'object') {
+      Object.entries(parsed.groceryRecords).forEach(([k, v]: [string, any]) => {
+        if (v && typeof v.itemKey === 'string' && typeof v.name === 'string') {
+          groceryRecords[k] = {
+            id: typeof v.id === 'string' ? v.id : makeSafeDocId(v.isCustom ? 'custom' : 'ing', v.itemKey),
+            itemKey: v.itemKey.slice(0, 160),
+            name: v.name.slice(0, 160),
+            amount: typeof v.amount === 'string' ? v.amount.slice(0, 40) : '1',
+            unit: typeof v.unit === 'string' ? v.unit.slice(0, 40) : 'unit',
+            checked: Boolean(v.checked),
+            isCustom: Boolean(v.isCustom),
+          };
+        }
+      });
+    }
+
+    const nutriScans: NutriScanRecord[] = Array.isArray(parsed.nutriScans)
+      ? parsed.nutriScans
+          .filter((s: any) => s && typeof s.mealName === 'string')
+          .slice(0, 12)
+          .map((s: any) => ({
+            id: typeof s.id === 'string' ? s.id : makeSafeDocId('scan', s.mealName.toLowerCase()),
+            query: typeof s.query === 'string' ? s.query : s.mealName,
+            mealName: s.mealName,
+            isFruitOrVegetable: Boolean(s.isFruitOrVegetable),
+            calories: typeof s.calories === 'string' ? s.calories : 'N/A',
+            carbohydrates: typeof s.carbohydrates === 'string' ? s.carbohydrates : 'N/A',
+            proteins: typeof s.proteins === 'string' ? s.proteins : 'N/A',
+            fats: typeof s.fats === 'string' ? s.fats : 'N/A',
+            vitamins: Array.isArray(s.vitamins) ? s.vitamins.filter((x: unknown): x is string => typeof x === 'string') : [],
+            minerals: Array.isArray(s.minerals) ? s.minerals.filter((x: unknown): x is string => typeof x === 'string') : [],
+            healthScore: typeof s.healthScore === 'number' ? s.healthScore : 50,
+            isUnhealthy: Boolean(s.isUnhealthy),
+            unhealthyExplanation: typeof s.unhealthyExplanation === 'string' ? s.unhealthyExplanation : '',
+            healthyAlternatives: Array.isArray(s.healthyAlternatives) ? s.healthyAlternatives : [],
+            funFact: typeof s.funFact === 'string' ? s.funFact : '',
+          }))
+      : [];
+
+    return {
+      currency,
+      hiddenRecipeIds,
+      mealPlans: mealPlans.length > 0 ? mealPlans : DEFAULT_MEAL_PLANS,
+      groceryRecords,
+      nutriScans,
+    };
+  } catch {
+    return defaults;
+  }
+}
+
 export default function App() {
-  // Tabs State
   const [activeTab, setActiveTab] = useState<'recipes' | 'planner' | 'nutricare' | 'shopping'>('recipes');
 
-  // Backup & Restore State
-  const [isBackupModalOpen, setIsBackupModalOpen] = useState(false);
-  const [dragActive, setDragActive] = useState(false);
-  const [backupError, setBackupError] = useState('');
-  const [backupSuccess, setBackupSuccess] = useState('');
-  
-  // Clipboard Copy and on-demand fetch states
-  const [copyingDb, setCopyingDb] = useState(false);
-  const [copyingLock, setCopyingLock] = useState(false);
+  const initialWorkspace = useMemo(() => loadWorkspaceFromStorage(), []);
 
-  // Handle database file download (db.json)
-  const handleDownloadBackup = () => {
-    try {
-      const anchor = document.createElement('a');
-      anchor.href = '/api/backup';
-      anchor.target = '_blank'; // Opens in new tab to guarantee download bypass in sandboxed iframes
-      anchor.download = 'db.json';
-      document.body.appendChild(anchor);
-      anchor.click();
-      document.body.removeChild(anchor);
-      setBackupSuccess('Initiated db.json download in your browser.');
-      setTimeout(() => setBackupSuccess(''), 4000);
-    } catch (err: any) {
-      setBackupError('Download error: ' + err.message);
-      setTimeout(() => setBackupError(''), 4000);
-    }
-  };
+  // Workspace preferences & state (no sign-in required; prices stay strictly in session memory)
+  const [currency, setCurrencyState] = useState<CurrencyType>(initialWorkspace.currency);
+  const [hiddenRecipeIds, setHiddenRecipeIds] = useState<string[]>(initialWorkspace.hiddenRecipeIds);
+  const [mealPlans, setMealPlans] = useState<MealPlan[]>(initialWorkspace.mealPlans);
+  const [groceryRecords, setGroceryRecords] = useState<Record<string, GroceryItemRecord>>(
+    initialWorkspace.groceryRecords
+  );
+  const [nutriScans, setNutriScans] = useState<NutriScanRecord[]>(initialWorkspace.nutriScans);
 
-  // Handle package-lock file download
-  const handleDownloadPackageLock = () => {
-    try {
-      const anchor = document.createElement('a');
-      anchor.href = '/api/package-lock';
-      anchor.target = '_blank'; // Opens in new tab to guarantee download bypass in sandboxed iframes
-      anchor.download = 'package-lock.json';
-      document.body.appendChild(anchor);
-      anchor.click();
-      document.body.removeChild(anchor);
-      setBackupSuccess('Initiated package-lock.json download in your browser.');
-      setTimeout(() => setBackupSuccess(''), 4000);
-    } catch (err: any) {
-      setBackupError('Download error: ' + err.message);
-      setTimeout(() => setBackupError(''), 4000);
-    }
-  };
+  const [groceryPrices, setGroceryPrices] = useState<Record<string, PriceState>>({});
+  const [activeNutrition, setActiveNutrition] = useState<NutritionData | null>(null);
+  const [pendingNutriQuery, setPendingNutriQuery] = useState<string | null>(null);
 
-  // Clipboard copies for perfect fallback support
-  const handleCopyDbToClipboard = async () => {
-    try {
-      setCopyingDb(true);
-      setBackupError('');
-      setBackupSuccess('');
-      const res = await fetch('/api/backup');
-      if (!res.ok) throw new Error('Failed to retrieve db.json from container');
-      const text = await res.text();
-      await navigator.clipboard.writeText(text);
-      setBackupSuccess('Copied db.json contents successfully to your clip board!');
-      setTimeout(() => setBackupSuccess(''), 4000);
-    } catch (err: any) {
-      setBackupError('Clipboard extraction error: ' + err.message);
-      setTimeout(() => setBackupError(''), 5000);
-    } finally {
-      setCopyingDb(false);
-    }
-  };
-
-  const handleCopyLockToClipboard = async () => {
-    try {
-      setCopyingLock(true);
-      setBackupError('');
-      setBackupSuccess('');
-      const res = await fetch('/api/package-lock');
-      if (!res.ok) throw new Error('Failed to retrieve package-lock.json from container');
-      const text = await res.text();
-      await navigator.clipboard.writeText(text);
-      setBackupSuccess('Copied package-lock.json contents successfully to your clip board!');
-      setTimeout(() => setBackupSuccess(''), 4000);
-    } catch (err: any) {
-      setBackupError('Clipboard extraction error: ' + err.message);
-      setTimeout(() => setBackupError(''), 5000);
-    } finally {
-      setCopyingLock(false);
-    }
-  };
-
-  // Process and upload db.json
-  const handleImportBackupFile = async (file: File) => {
-    if (!file) return;
-    setBackupError('');
-    setBackupSuccess('');
-    
-    // File validation
-    if (!file.name.endsWith('.json')) {
-      setBackupError('Error: Database file must be a JSON (.json) file');
-      return;
-    }
-
-    const reader = new FileReader();
-    reader.onload = async (e) => {
-      try {
-        const text = e.target?.result as string;
-        let parsed;
-        try {
-          parsed = JSON.parse(text);
-        } catch (jsonErr) {
-          throw new Error('File contents are not valid standard JSON');
-        }
-
-        if (!parsed || typeof parsed !== 'object') {
-          throw new Error('Backup must be a JSON object containing recipes');
-        }
-        if (!Array.isArray(parsed.recipes)) {
-          throw new Error('Invalid file schema: "recipes" list is missing or invalid');
-        }
-
-        const response = await fetch('/api/backup', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(parsed)
-        });
-
-        if (!response.ok) {
-          const errRes = await response.json().catch(() => ({ error: 'Upload failed' }));
-          throw new Error(errRes.error || 'Server rejected database file');
-        }
-
-        setBackupSuccess('Database successfully restored! Page reloading...');
-        setTimeout(() => {
-          window.location.reload();
-        }, 1500);
-      } catch (err: any) {
-        setBackupError(err.message || 'Error occurred during processing');
-      }
-    };
-    reader.readAsText(file);
-  };
-
-  const handleDrag = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.type === "dragenter" || e.type === "dragover") {
-      setDragActive(true);
-    } else if (e.type === "dragleave") {
-      setDragActive(false);
-    }
-  };
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragActive(false);
-    
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      handleImportBackupFile(e.dataTransfer.files[0]);
-    }
-  };
-
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    e.preventDefault();
-    if (e.target.files && e.target.files[0]) {
-      handleImportBackupFile(e.target.files[0]);
-    }
-  };
-
-  // Global Currency State
-  const [currency, setCurrency] = useState<CurrencyType>(() => {
-    const saved = localStorage.getItem('cookbook_currency');
-    return (saved as CurrencyType) || 'USD';
-  });
+  // Currency exchange rates
   const [exchangeRates, setExchangeRates] = useState<Record<string, number>>(FALLBACK_RATES);
 
-  // Fetch real-time exchange rates on mount
+  // Recipe Book Search & Filters
+  const [searchTerm, setSearchTerm] = useState('');
+  const [selectedCategory, setSelectedCategory] = useState<string>('All');
+  const [selectedTag, setSelectedTag] = useState<string>('');
+  const [visibleCount, setVisibleCount] = useState(24);
+  const [selectedRecipe, setSelectedRecipe] = useState<Recipe | null>(null);
+
+  // Fetch live exchange rates once
   useEffect(() => {
     async function fetchLiveRates() {
       try {
@@ -217,668 +187,485 @@ export default function App() {
             setExchangeRates(data.rates);
           }
         }
-      } catch (err) {
-        console.warn('Real-time currency rates fetch failed. Using preloaded fallback rates.', err);
+      } catch {
+        // Fallback rates remain active
       }
     }
     fetchLiveRates();
   }, []);
 
-  // Save selected currency choice to localStorage
+  // Persist non-sensitive workspace preferences locally (never persists prices or credentials)
   useEffect(() => {
-    localStorage.setItem('cookbook_currency', currency);
-  }, [currency]);
+    try {
+      const payload: PersistedWorkspace = {
+        currency,
+        hiddenRecipeIds,
+        mealPlans,
+        groceryRecords,
+        nutriScans,
+      };
+      window.localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // Ignore storage quota or private-mode restrictions
+    }
+  }, [currency, hiddenRecipeIds, mealPlans, groceryRecords, nutriScans]);
 
-  // Application Data States
-  const [recipes, setRecipes] = useState<Recipe[]>([]);
-  const [mealPlans, setMealPlans] = useState<MealPlan[]>([]);
-
-  // Search & Filters State for Recipe views
-  const [searchTerm, setSearchTerm] = useState('');
-  const [selectedCategory, setSelectedCategory] = useState<string>('All');
-  const [selectedTag, setSelectedTag] = useState<string>('');
-  
-  // Pagination / Load More states to optimize rendering latency
-  const [visibleCount, setVisibleCount] = useState(24);
-
-  // Reset pagination when category, search, or tag filter settings change
   useEffect(() => {
     setVisibleCount(24);
   }, [selectedCategory, searchTerm, selectedTag]);
 
-  // UI Control states
-  const [selectedRecipe, setSelectedRecipe] = useState<Recipe | null>(null);
-  
-  // Loading & Error boundary states
-  const [isLoading, setIsLoading] = useState(true);
-  const [errorMsg, setErrorMsg] = useState('');
+  const visibleRecipes = useMemo(() => {
+    const hiddenSet = new Set(hiddenRecipeIds);
+    return CURATED_RECIPES.filter((r) => !hiddenSet.has(r._id));
+  }, [hiddenRecipeIds]);
 
-  // 1. Initial Load: Fetch recipes and mealplans in parallel
-  useEffect(() => {
-    async function loadInitialData() {
-      setIsLoading(true);
-      setErrorMsg('');
-      try {
-        const [recipesRes, mealPlansRes] = await Promise.all([
-          fetch('/api/recipes'),
-          fetch('/api/mealplan')
-        ]);
+  const filteredRecipes = useMemo(() => {
+    const q = searchTerm.toLowerCase();
+    return visibleRecipes.filter((recipe) => {
+      const matchesSearch =
+        !q ||
+        recipe.name.toLowerCase().includes(q) ||
+        recipe.description.toLowerCase().includes(q) ||
+        recipe.tags.some((t) => t.toLowerCase().includes(q)) ||
+        recipe.ingredients.some((i) => i.name.toLowerCase().includes(q));
+      const matchesCategory = selectedCategory === 'All' || recipe.category === selectedCategory;
+      const matchesTag =
+        !selectedTag || recipe.tags.some((t) => t.toLowerCase() === selectedTag.toLowerCase());
+      return matchesSearch && matchesCategory && matchesTag;
+    });
+  }, [visibleRecipes, searchTerm, selectedCategory, selectedTag]);
 
-        if (!recipesRes.ok || !mealPlansRes.ok) {
-          throw new Error('Failed to load assets from Express server cluster');
-        }
+  const uniqueTags = useMemo(
+    () => Array.from(new Set(visibleRecipes.flatMap((r) => r.tags || []).map((t) => t.trim()))).sort(),
+    [visibleRecipes]
+  );
 
-        const [recipesData, mealPlansData] = await Promise.all([
-          recipesRes.json(),
-          mealPlansRes.json()
-        ]);
-
-        setRecipes(recipesData);
-        setMealPlans(mealPlansData);
-      } catch (err: any) {
-        console.error("Initial data load error:", err);
-        setErrorMsg('Unable to connect to the Express & MongoDB-style backend. Is the server running?');
-      } finally {
-        setIsLoading(false);
-      }
-    }
-
-    loadInitialData();
-  }, []);
-
-  // --- API Mutation Helpers ---
-
-  // Delete Recipe - DELETE /api/recipes/:id
-  const handleDeleteRecipe = async (id: string, e: React.MouseEvent) => {
-    e.stopPropagation(); // Avoid triggering details modal
-    if (!window.confirm('Delete this recipe permanentely?')) return;
-    
-    try {
-      const res = await fetch(`/api/recipes/${id}`, { method: 'DELETE' });
-      if (!res.ok) throw new Error('Unsuccessful delete operation');
-      
-      setRecipes(prev => prev.filter(r => r._id !== id));
-      
-      // Also clean up any assigned planner slots using this recipe ID
-      const updatedPlans = await Promise.all(
-        mealPlans.map(async (p) => {
-          let needsUpdate = false;
-          const cleanPlan = { ...p };
-          if (cleanPlan.breakfast === id) { cleanPlan.breakfast = undefined; needsUpdate = true; }
-          if (cleanPlan.lunch === id) { cleanPlan.lunch = undefined; needsUpdate = true; }
-          if (cleanPlan.dinner === id) { cleanPlan.dinner = undefined; needsUpdate = true; }
-          
-          if (needsUpdate) {
-            await fetch('/api/mealplan', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(cleanPlan)
-            });
-          }
-          return cleanPlan;
-        })
-      );
-      setMealPlans(updatedPlans);
-    } catch (err: any) {
-      alert(err.message || 'Failed to delete recipe');
-    }
+  // Handlers
+  const handleSetCurrency = (nextCurrency: CurrencyType) => {
+    setCurrencyState(nextCurrency);
   };
 
-  // Update Meal Planner Slot - POST /api/mealplan
-  const handleUpdateMeal = async (day: MealPlan['day'], slot: 'breakfast' | 'lunch' | 'dinner', recipeId: string | null) => {
-    try {
-      // Find current day plan or start empty
-      const currentDayPlan = mealPlans.find(p => p.day === day) || { day };
-      const updatedParam = {
-        ...currentDayPlan,
-        [slot]: recipeId || undefined
+  const handleHideRecipe = (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setHiddenRecipeIds((prev) => Array.from(new Set([...prev, id])).slice(0, 500));
+    setMealPlans((prev) =>
+      prev.map((p) => ({
+        ...p,
+        breakfast: p.breakfast === id ? undefined : p.breakfast,
+        lunch: p.lunch === id ? undefined : p.lunch,
+        dinner: p.dinner === id ? undefined : p.dinner,
+      }))
+    );
+  };
+
+  const handleRestoreHiddenRecipes = () => {
+    setHiddenRecipeIds([]);
+  };
+
+  const handleUpdateMeal = async (
+    day: DayOfWeek,
+    slot: 'breakfast' | 'lunch' | 'dinner',
+    recipeId: string | null
+  ) => {
+    setMealPlans((prev) => {
+      const existingPlan = prev.find((p) => p.day === day);
+      const updatedPlan: MealPlan = {
+        ...(existingPlan || { day }),
+        [slot]: recipeId || undefined,
       };
-
-      const res = await fetch('/api/mealplan', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updatedParam)
-      });
-
-      if (!res.ok) throw new Error('Failed to save meal assignment');
-      const savedPlan = await res.json();
-
-      setMealPlans(prev => {
-        const index = prev.findIndex(p => p.day === day);
-        if (index === -1) return [...prev, savedPlan];
-        const copy = [...prev];
-        copy[index] = savedPlan;
-        return copy;
-      });
-    } catch (err: any) {
-      alert(err.message || 'Failed to update plan');
-    }
+      const idx = prev.findIndex((p) => p.day === day);
+      if (idx === -1) return [...prev, updatedPlan];
+      const next = [...prev];
+      next[idx] = updatedPlan;
+      return next;
+    });
   };
 
+  const handleSaveGroceryItem = async (params: {
+    itemKey: string;
+    name: string;
+    amount: string;
+    unit: string;
+    checked: boolean;
+    isCustom: boolean;
+  }) => {
+    const existing = groceryRecords[params.itemKey];
+    const docId = existing?.id || makeSafeDocId(params.isCustom ? 'custom' : 'ing', params.itemKey);
 
-  // --- Recipe Search & Filtering ---
-  
-  const filteredRecipes = recipes.filter(recipe => {
-    const matchesSearch = 
-      recipe.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      recipe.description.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      recipe.tags.some(tag => tag.toLowerCase().includes(searchTerm.toLowerCase())) ||
-      recipe.ingredients.some(ing => ing.name.toLowerCase().includes(searchTerm.toLowerCase()));
+    setGroceryRecords((prev) => ({
+      ...prev,
+      [params.itemKey]: {
+        id: docId,
+        ...params,
+      },
+    }));
+  };
 
-    const matchesCategory = selectedCategory === 'All' || recipe.category === selectedCategory;
-    const matchesTag = !selectedTag || recipe.tags.some(t => t.toLowerCase() === selectedTag.toLowerCase());
+  const handleDeleteCustomGroceryItem = async (itemKey: string) => {
+    setGroceryRecords((prev) => {
+      const next = { ...prev };
+      delete next[itemKey];
+      return next;
+    });
+    setGroceryPrices((prev) => {
+      const next = { ...prev };
+      delete next[itemKey];
+      return next;
+    });
+  };
 
-    return matchesSearch && matchesCategory && matchesTag;
-  });
+  const handleResetGroceryChecks = async () => {
+    setGroceryRecords((prev) => {
+      const next: Record<string, GroceryItemRecord> = {};
+      (Object.entries(prev) as [string, GroceryItemRecord][]).forEach(([k, v]) => {
+        next[k] = { ...v, checked: false };
+      });
+      return next;
+    });
+  };
 
-  // Extract all unique tags across recipes to easily quick-filter
-  const uniqueTags = Array.from(
-    new Set(recipes.flatMap(r => r.tags || []).map(t => t.trim()))
-  ).sort();
+  const handleSaveNutriScan = async (queryText: string, data: NutritionData) => {
+    const docId = makeSafeDocId('scan', queryText.toLowerCase());
+    setNutriScans((prev) => {
+      const filtered = prev.filter((s) => s.id !== docId);
+      return [{ id: docId, query: queryText, ...data }, ...filtered].slice(0, 12);
+    });
+  };
+
+  const handleClearNutriHistory = async () => {
+    setNutriScans([]);
+  };
+
+  const handleScanFromRecipe = (mealName: string) => {
+    setPendingNutriQuery(mealName);
+    setActiveTab('nutricare');
+  };
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col antialiased selection:bg-emerald-100 selection:text-emerald-900">
-      
-      {/* Upper Brand bar */}
-      <header className="border-b border-slate-200 bg-white relative w-full z-40 shadow-xs">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-          
-          {/* Logo */}
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-emerald-600 rounded-lg flex items-center justify-center text-white shadow-xs">
-              <ChefHat size={18} className="stroke-[2.5]" />
+    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col antialiased selection:bg-emerald-100 selection:text-emerald-950 pb-16 md:pb-0">
+      {/* Header */}
+      <header className="border-b border-slate-200 bg-white sticky top-0 w-full z-40 shadow-xs">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3 shrink-0">
+            <div className="w-9 h-9 bg-emerald-600 rounded-xl flex items-center justify-center text-white shadow-xs">
+              <ChefHat size={19} className="stroke-[2.3]" />
             </div>
             <div>
-              <h1 className="font-sans text-sm font-extrabold tracking-tight text-slate-800 flex items-center gap-2 leading-none">
+              <h1 className="font-sans text-sm font-extrabold tracking-tight text-slate-800 leading-none">
                 CookBook
               </h1>
-              <p className="font-sans text-[9px] font-bold text-emerald-600 tracking-wider uppercase mt-0.5">
-                Your ultimate guide to cook
+              <p className="font-sans text-[10px] font-bold text-emerald-600 tracking-wider uppercase mt-0.5">
+                Culinary Planner &amp; NutriCare
               </p>
             </div>
           </div>
 
-          {/* Navigation Tabs and Database Management Trigger */}
-          <div className="flex items-center gap-2 sm:gap-3">
-            <nav className="hidden md:flex space-x-1">
-              <button
-                onClick={() => setActiveTab('recipes')}
-                className={`px-4 py-1.5 rounded-lg font-sans text-xs font-semibold flex items-center gap-2 transition cursor-pointer ${
-                  activeTab === 'recipes' 
-                    ? 'bg-emerald-600 text-white shadow-xs' 
-                    : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                }`}
-              >
-                <BookOpen size={13} />
-                Recipe Book
-              </button>
-              <button
-                onClick={() => setActiveTab('nutricare')}
-                className={`px-4 py-1.5 rounded-lg font-sans text-xs font-semibold flex items-center gap-2 transition cursor-pointer ${
-                  activeTab === 'nutricare' 
-                    ? 'bg-emerald-600 text-white shadow-xs' 
-                    : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                }`}
-              >
-                <Heart size={13} className="text-rose-500 fill-rose-500" />
-                Nutri Care
-              </button>
-              <button
-                onClick={() => setActiveTab('shopping')}
-                className={`px-4 py-1.5 rounded-lg font-sans text-xs font-semibold flex items-center gap-2 transition cursor-pointer ${
-                  activeTab === 'shopping' 
-                    ? 'bg-emerald-600 text-white shadow-xs' 
-                    : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                }`}
-              >
-                <ShoppingBag size={13} />
-                Grocery List
-              </button>
-              <button
-                onClick={() => setActiveTab('planner')}
-                className={`px-4 py-1.5 rounded-lg font-sans text-xs font-semibold flex items-center gap-2 transition cursor-pointer ${
-                  activeTab === 'planner' 
-                    ? 'bg-emerald-600 text-white shadow-xs' 
-                    : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
-                }`}
-              >
-                <Calendar size={13} />
-                Weekly Planner
-              </button>
-            </nav>
-
+          <nav className="hidden md:flex items-center gap-1">
             <button
-              onClick={() => {
-                setBackupError('');
-                setBackupSuccess('');
-                setIsBackupModalOpen(true);
-              }}
-              title="Database Backup & Restore center"
-              className="px-3 py-1.5 rounded-lg border border-slate-200 hover:border-emerald-600 hover:bg-emerald-50/50 text-slate-600 hover:text-emerald-700 font-sans text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer shadow-2xs"
+              type="button"
+              onClick={() => setActiveTab('recipes')}
+              className={`px-3.5 py-2 rounded-xl font-sans text-xs font-semibold flex items-center gap-2 transition cursor-pointer ${
+                activeTab === 'recipes'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+              }`}
             >
-              <Database size={13} className="text-emerald-600" />
-              <span className="hidden sm:inline">Backup & Restore</span>
+              <BookOpen size={14} />
+              Recipe Book
             </button>
-          </div>
+            <button
+              type="button"
+              onClick={() => setActiveTab('nutricare')}
+              className={`px-3.5 py-2 rounded-xl font-sans text-xs font-semibold flex items-center gap-2 transition cursor-pointer ${
+                activeTab === 'nutricare'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+              }`}
+            >
+              <Heart
+                size={14}
+                className={activeTab === 'nutricare' ? 'text-white fill-white' : 'text-rose-500 fill-rose-500'}
+              />
+              NutriCare
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('shopping')}
+              className={`px-3.5 py-2 rounded-xl font-sans text-xs font-semibold flex items-center gap-2 transition cursor-pointer ${
+                activeTab === 'shopping'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+              }`}
+            >
+              <ShoppingBag size={14} />
+              Grocery List
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('planner')}
+              className={`px-3.5 py-2 rounded-xl font-sans text-xs font-semibold flex items-center gap-2 transition cursor-pointer ${
+                activeTab === 'planner'
+                  ? 'bg-emerald-600 text-white shadow-xs'
+                  : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+              }`}
+            >
+              <Calendar size={14} />
+              Weekly Planner
+            </button>
+          </nav>
         </div>
       </header>
 
-      {/* Main Container */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex-1 w-full">
-        {isLoading ? (
-          <SkeletonLoader />
-        ) : errorMsg ? (
-          <div className="rounded-2xl border border-rose-200 bg-rose-50/50 p-6 text-center max-w-xl mx-auto mt-10 space-y-4">
-            <h3 className="font-sans text-base font-bold text-rose-900">Database Connection Error</h3>
-            <p className="font-sans text-xs text-rose-700 leading-relaxed">{errorMsg}</p>
-            <div className="p-3 bg-white/85 rounded-xl border border-rose-100 font-mono text-[10px] text-left text-rose-900 whitespace-pre-wrap">
-              Is Node Express listening on Port 3000? Verify "npm run dev" commands exist.
-            </div>
-          </div>
-        ) : (
-          <>
-            {/* View renders depending on chosen activeTab */}
-            {activeTab === 'recipes' && (
-              <div className="space-y-6 animate-tab-fade">
-                
-                {/* Filter / Search Bar */}
-                <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-xs space-y-4">
-                  <div className="flex flex-col md:flex-row gap-3">
-                    {/* Search Field */}
-                    <div className="relative flex-1">
-                      <Search size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
-                      <input 
-                        id="recipe-search"
-                        type="text" 
-                        value={searchTerm}
-                        onChange={(e) => setSearchTerm(e.target.value)} 
-                        placeholder="Search recipes, ingredients (e.g. avocado, pasta), or tags..."
-                        className="w-full bg-slate-100/80 border-none rounded-full py-2.5 pl-10 pr-4 font-sans text-xs text-slate-800 placeholder-slate-400 focus:bg-slate-100 focus:ring-2 focus:ring-emerald-500 focus:outline-hidden transition-all duration-200"
-                      />
-                    </div>
-
-                    {/* Category quick selectors */}
-                    <div className="flex gap-1 overflow-x-auto pb-1 md:pb-0 scrollbar-none font-sans text-xs">
-                      {['All', 'Breakfast', 'Lunch', 'Dinner', 'Dessert', 'Snack'].map((cat) => (
-                        <button
-                          key={cat}
-                          onClick={() => setSelectedCategory(cat)}
-                          className={`px-3 py-2 rounded-lg font-medium transition whitespace-nowrap cursor-pointer ${
-                            selectedCategory === cat 
-                              ? 'bg-emerald-50 text-emerald-700 font-semibold' 
-                              : 'text-slate-600 hover:bg-slate-50'
-                          }`}
-                        >
-                          {cat}
-                        </button>
-                      ))}
-                    </div>
+        {activeTab === 'recipes' && (
+          <div className="space-y-6 animate-tab-fade">
+            {/* Asymmetric Search & Category Strip */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
+              <div className="lg:col-span-8 rounded-2xl border border-slate-200 bg-white p-4 shadow-xs space-y-4">
+                <div className="flex flex-col md:flex-row gap-3">
+                  <div className="relative flex-1">
+                    <Search
+                      size={15}
+                      className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400"
+                    />
+                    <input
+                      id="recipe-search"
+                      type="text"
+                      value={searchTerm}
+                      onChange={(e) => setSearchTerm(e.target.value)}
+                      placeholder="Search recipes, ingredients (e.g. avocado, pasta), or tags..."
+                      className="w-full bg-slate-100/80 border border-transparent rounded-xl py-2.5 pl-10 pr-4 font-sans text-xs text-slate-800 placeholder-slate-400 focus:bg-white focus:border-emerald-300 focus:ring-2 focus:ring-emerald-500/20 focus:outline-hidden transition-all"
+                    />
                   </div>
 
-                  {/* Sub-Filters / Tags list */}
-                  {uniqueTags.length > 0 && (
-                    <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center gap-1.5">
-                      <span className="font-sans text-[10px] font-semibold uppercase tracking-wider text-slate-400">
-                        Popular Tags:
-                      </span>
-                      {selectedTag && (
-                        <button
-                          onClick={() => setSelectedTag('')}
-                          className="px-2 py-0.5 rounded bg-slate-900 text-white font-sans text-[9px] font-bold"
-                        >
-                          × Clear ({selectedTag})
-                        </button>
-                      )}
-                      {uniqueTags.map((t) => (
-                        <button
-                          key={t}
-                          onClick={() => setSelectedTag(t === selectedTag ? '' : t)}
-                          className={`px-2 py-0.5 rounded font-sans text-[10px] font-medium tracking-wide transition ${
-                            selectedTag === t 
-                              ? 'bg-emerald-600 text-white' 
-                              : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                          }`}
-                        >
-                          {t}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                {/* Recipe lists info bar */}
-                <div className="flex items-center justify-between pb-1">
-                  <span className="font-sans text-xs font-bold uppercase tracking-wider text-slate-400">
-                    Seeded Recipes ({filteredRecipes.length} shown)
-                  </span>
-                </div>
-
-                {/* Grid */}
-                {filteredRecipes.length === 0 ? (
-                  <div className="flex flex-col items-center justify-center p-16 rounded-2xl border border-dashed border-slate-200 bg-white text-center">
-                    <Utensils size={32} className="text-slate-300 gap-1.5 mb-2" />
-                    <p className="font-sans text-sm font-bold text-slate-700">No Matching Culinary Delights found</p>
-                    <p className="font-sans text-xs text-slate-400 mt-0.5">Try altering your search keywords or tags filters!</p>
+                  <div className="flex gap-1 overflow-x-auto pb-1 md:pb-0 font-sans text-xs">
+                    {['All', 'Breakfast', 'Lunch', 'Dinner', 'Dessert', 'Snack'].map((cat) => (
+                      <button
+                        key={cat}
+                        type="button"
+                        onClick={() => setSelectedCategory(cat)}
+                        className={`px-3 py-2 rounded-lg font-medium transition whitespace-nowrap cursor-pointer ${
+                          selectedCategory === cat
+                            ? 'bg-emerald-50 text-emerald-700 font-semibold'
+                            : 'text-slate-600 hover:bg-slate-50'
+                        }`}
+                      >
+                        {cat}
+                      </button>
+                    ))}
                   </div>
-                ) : (
-                  <>
-                    <div id="recipe-cards-grid" className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                      <AnimatePresence mode="popLayout">
-                        {filteredRecipes.slice(0, visibleCount).map((recipe) => (
-                          <RecipeCard 
-                            key={recipe._id}
-                            recipe={recipe}
-                            onSelect={setSelectedRecipe}
-                            onDelete={handleDeleteRecipe}
-                          />
-                        ))}
-                      </AnimatePresence>
-                    </div>
-                    {filteredRecipes.length > visibleCount && (
-                      <div className="mt-10 flex justify-center">
-                        <button
-                          onClick={() => setVisibleCount(prev => prev + 24)}
-                          className="px-6 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200/80 text-slate-700 font-semibold font-sans text-xs flex items-center gap-2 transition cursor-pointer shadow-xs border border-slate-200/50"
-                        >
-                          Show More Recipes ({filteredRecipes.length - visibleCount} remaining)
-                        </button>
-                      </div>
+                </div>
+
+                {uniqueTags.length > 0 && (
+                  <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center gap-1.5">
+                    <span className="font-sans text-[10px] font-semibold uppercase tracking-wider text-slate-400">
+                      Tags:
+                    </span>
+                    {selectedTag && (
+                      <button
+                        type="button"
+                        onClick={() => setSelectedTag('')}
+                        className="px-2 py-0.5 rounded bg-slate-900 text-white font-sans text-[9px] font-bold cursor-pointer"
+                      >
+                        × Clear ({selectedTag})
+                      </button>
                     )}
-                  </>
+                    {uniqueTags.map((t) => (
+                      <button
+                        key={t}
+                        type="button"
+                        onClick={() => setSelectedTag(t === selectedTag ? '' : t)}
+                        className={`px-2 py-0.5 rounded font-sans text-[10px] font-medium tracking-wide transition cursor-pointer ${
+                          selectedTag === t
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                        }`}
+                      >
+                        {t}
+                      </button>
+                    ))}
+                  </div>
                 )}
               </div>
-            )}
 
-            {activeTab === 'planner' && (
-              <MealPlannerView 
-                recipes={recipes}
-                mealPlans={mealPlans}
-                onUpdateMeal={handleUpdateMeal}
-                onSelectRecipeDetails={setSelectedRecipe}
-              />
-            )}
+              {/* Asymmetric Quick Summary Card */}
+              <div className="lg:col-span-4 rounded-2xl border border-emerald-200/70 bg-gradient-to-br from-emerald-50/70 via-white to-teal-50/40 p-5 flex flex-col justify-between gap-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <span className="font-sans text-[10px] font-bold uppercase tracking-wider text-emerald-700 block">
+                      Curated Collection
+                    </span>
+                    <p className="font-sans text-lg font-black text-slate-800 mt-0.5">
+                      {filteredRecipes.length} Recipes Available
+                    </p>
+                  </div>
+                  {hiddenRecipeIds.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleRestoreHiddenRecipes}
+                      className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-700 bg-white border border-emerald-200 px-2.5 py-1 rounded-lg hover:bg-emerald-50 transition cursor-pointer"
+                    >
+                      <RotateCcw size={11} />
+                      Restore ({hiddenRecipeIds.length})
+                    </button>
+                  )}
+                </div>
+                <p className="font-sans text-xs text-slate-500 leading-relaxed">
+                  Tap any recipe to view ingredients, step-by-step instructions, or run an instant NutriCare breakdown.
+                </p>
+              </div>
+            </div>
 
-            {activeTab === 'shopping' && (
-              <ShoppingListView 
-                recipes={recipes}
-                mealPlans={mealPlans}
-                currency={currency}
-                exchangeRates={exchangeRates}
-                setCurrency={setCurrency}
-              />
+            {filteredRecipes.length === 0 ? (
+              <div className="flex flex-col items-center justify-center p-16 rounded-2xl border border-dashed border-slate-200 bg-white text-center">
+                <Utensils size={32} className="text-slate-300 mb-2" />
+                <p className="font-sans text-sm font-bold text-slate-700">
+                  No Matching Recipes Found
+                </p>
+                <p className="font-sans text-xs text-slate-400 mt-0.5">
+                  Try adjusting your search keywords, category, or tag filters.
+                </p>
+              </div>
+            ) : (
+              <>
+                <div
+                  id="recipe-cards-grid"
+                  className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"
+                >
+                  {filteredRecipes.slice(0, visibleCount).map((recipe) => (
+                    <RecipeCard
+                      key={recipe._id}
+                      recipe={recipe}
+                      currency={currency}
+                      exchangeRates={exchangeRates}
+                      onSelect={setSelectedRecipe}
+                      onHide={handleHideRecipe}
+                    />
+                  ))}
+                </div>
+                {filteredRecipes.length > visibleCount && (
+                  <div className="mt-10 flex justify-center">
+                    <button
+                      type="button"
+                      onClick={() => setVisibleCount((prev) => prev + 24)}
+                      className="px-6 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200/80 text-slate-700 font-semibold font-sans text-xs flex items-center gap-2 transition cursor-pointer shadow-xs border border-slate-200/60"
+                    >
+                      Show More Recipes ({filteredRecipes.length - visibleCount} remaining)
+                    </button>
+                  </div>
+                )}
+              </>
             )}
+          </div>
+        )}
 
-            {activeTab === 'nutricare' && (
-              <NutriCareView />
-            )}
-          </>
+        {activeTab === 'planner' && (
+          <MealPlannerView
+            recipes={visibleRecipes}
+            mealPlans={mealPlans}
+            currency={currency}
+            exchangeRates={exchangeRates}
+            onUpdateMeal={handleUpdateMeal}
+            onSelectRecipeDetails={setSelectedRecipe}
+          />
+        )}
+
+        {activeTab === 'shopping' && (
+          <ShoppingListView
+            recipes={visibleRecipes}
+            mealPlans={mealPlans}
+            groceryRecords={groceryRecords}
+            prices={groceryPrices}
+            setPrices={setGroceryPrices}
+            currency={currency}
+            exchangeRates={exchangeRates}
+            setCurrency={handleSetCurrency}
+            onSaveGroceryItem={handleSaveGroceryItem}
+            onDeleteCustomItem={handleDeleteCustomGroceryItem}
+            onResetChecks={handleResetGroceryChecks}
+          />
+        )}
+
+        {activeTab === 'nutricare' && (
+          <NutriCareView
+            savedScans={nutriScans}
+            activeNutrition={activeNutrition}
+            onSelectNutrition={setActiveNutrition}
+            onSaveScan={handleSaveNutriScan}
+            onClearHistory={handleClearNutriHistory}
+            externalQuery={pendingNutriQuery}
+            onClearExternalQuery={() => setPendingNutriQuery(null)}
+          />
         )}
       </main>
 
-      {/* Footer information details */}
       <footer className="border-t border-slate-200 bg-white py-8 mt-12 shrink-0">
         <div className="max-w-2xl mx-auto px-4 text-center font-sans space-y-2">
           <p className="text-sm font-semibold text-emerald-800">Thank you for visiting CookBook!</p>
           <p className="text-xs text-slate-600 leading-relaxed">
-            We hope this personalized digital planner makes your culinary journey simpler, organized, and filled with delicious adventures. Keep testing new recipes, scheduling vibrant dinners, and sharing the joy of homemade meals!
+            Plan balanced meals, generate consolidated grocery estimates, and scan nutritional profiles seamlessly.
           </p>
           <p className="text-[10px] text-slate-400 font-medium pt-1">
-            © 2026 CookBook • Curated with passion for home chefs everywhere
+            © 2026 CookBook • Curated for home chefs
           </p>
         </div>
       </footer>
 
-      {/* Mobile Sticky Action Bar */}
+      {/* Mobile Sticky Bottom Navigation */}
       <div className="md:hidden fixed bottom-0 inset-x-0 bg-white border-t border-slate-200 z-40 px-4 py-2.5 flex items-center justify-around shadow-lg">
         <button
+          type="button"
           onClick={() => setActiveTab('recipes')}
-          className={`flex flex-col items-center gap-1 p-1 ${activeTab === 'recipes' ? 'text-emerald-600' : 'text-slate-400'}`}
+          className={`flex flex-col items-center gap-1 p-1 ${
+            activeTab === 'recipes' ? 'text-emerald-600' : 'text-slate-400'
+          }`}
         >
           <BookOpen size={18} />
           <span className="font-sans text-[9px] font-bold">Recipes</span>
         </button>
         <button
+          type="button"
           onClick={() => setActiveTab('nutricare')}
-          className={`flex flex-col items-center gap-1 p-1 ${activeTab === 'nutricare' ? 'text-emerald-700 font-bold' : 'text-slate-400'}`}
+          className={`flex flex-col items-center gap-1 p-1 ${
+            activeTab === 'nutricare' ? 'text-emerald-700 font-bold' : 'text-slate-400'
+          }`}
         >
-          <Heart size={18} className={activeTab === 'nutricare' ? 'text-rose-500 fill-rose-500' : 'text-slate-400'} />
-          <span className="font-sans text-[9px] font-bold">Nutri Care</span>
+          <Heart
+            size={18}
+            className={activeTab === 'nutricare' ? 'text-rose-500 fill-rose-500' : 'text-slate-400'}
+          />
+          <span className="font-sans text-[9px] font-bold">NutriCare</span>
         </button>
         <button
+          type="button"
           onClick={() => setActiveTab('shopping')}
-          className={`flex flex-col items-center gap-1 p-1 ${activeTab === 'shopping' ? 'text-emerald-600' : 'text-slate-400'}`}
+          className={`flex flex-col items-center gap-1 p-1 ${
+            activeTab === 'shopping' ? 'text-emerald-600' : 'text-slate-400'
+          }`}
         >
           <ShoppingBag size={18} />
           <span className="font-sans text-[9px] font-bold">Groceries</span>
         </button>
         <button
+          type="button"
           onClick={() => setActiveTab('planner')}
-          className={`flex flex-col items-center gap-1 p-1 ${activeTab === 'planner' ? 'text-emerald-600' : 'text-slate-400'}`}
+          className={`flex flex-col items-center gap-1 p-1 ${
+            activeTab === 'planner' ? 'text-emerald-600' : 'text-slate-400'
+          }`}
         >
           <Calendar size={18} />
           <span className="font-sans text-[9px] font-bold">Planner</span>
         </button>
       </div>
 
-
-
-      {/* Recipe view details details overlay */}
       {selectedRecipe && (
-        <RecipeDetailsModal 
+        <RecipeDetailsModal
           recipe={selectedRecipe}
+          currency={currency}
+          exchangeRates={exchangeRates}
           onClose={() => setSelectedRecipe(null)}
+          onScanInNutriCare={handleScanFromRecipe}
         />
-      )}
-
-      {/* Database Backup & Restore Center Modal Overlay */}
-      {isBackupModalOpen && (
-        <div id="db-backup-modal" className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs z-50 flex items-center justify-center p-4 animate-fade-in">
-          <div className="bg-white rounded-2xl max-w-md w-full shadow-2xl overflow-hidden border border-slate-100 flex flex-col max-h-[90vh] animate-scale-up">
-            
-            {/* Header */}
-            <div className="px-5 py-4 border-b border-slate-100 bg-emerald-50/50 flex items-center justify-between">
-              <div className="flex items-center gap-2 text-emerald-800">
-                <Database size={16} className="text-emerald-600 animate-pulse" />
-                <h3 className="font-sans text-sm font-bold tracking-tight">Database Center</h3>
-              </div>
-              <button
-                onClick={() => setIsBackupModalOpen(false)}
-                className="text-slate-400 hover:text-slate-600 hover:bg-slate-100 p-1.5 rounded-full transition cursor-pointer"
-              >
-                <X size={15} />
-              </button>
-            </div>
-
-            {/* Content Body */}
-            <div className="p-6 space-y-5 overflow-y-auto">
-              <p className="font-sans text-xs text-slate-500 leading-relaxed">
-                Manage, export, or restore your customized culinary cookbook. Restoring a backup fully replaces your local cookbook database with the chosen setup.
-              </p>
-
-              {/* Database Metrics Stats */}
-              <div className="grid grid-cols-3 gap-3 bg-slate-50 p-3 rounded-xl border border-slate-100 text-center">
-                <div>
-                  <span className="block font-sans text-lg font-extrabold text-emerald-700 leading-none">
-                    {recipes.length}
-                  </span>
-                  <span className="font-sans text-[10px] font-bold text-slate-400 uppercase tracking-wide">
-                    Recipes
-                  </span>
-                </div>
-                <div>
-                  <span className="block font-sans text-lg font-extrabold text-emerald-700 leading-none">
-                    {mealPlans.filter(p => p.breakfast || p.lunch || p.dinner).length}
-                  </span>
-                  <span className="font-sans text-[10px] font-bold text-slate-400 uppercase tracking-wide">
-                    Scheduled
-                  </span>
-                </div>
-                <div>
-                  <span className="block font-sans text-lg font-extrabold text-emerald-700 leading-none">
-                    {recipes.reduce((acc, r) => acc + (r.ingredients ? r.ingredients.length : 0), 0)}
-                  </span>
-                  <span className="font-sans text-[10px] font-bold text-slate-400 uppercase tracking-wide">
-                    Ingredients
-                  </span>
-                </div>
-              </div>
-
-              {/* Status alerts */}
-              {backupSuccess && (
-                <div className="rounded-xl border border-emerald-200 bg-emerald-50/80 p-3 flex gap-2.5 items-start text-emerald-800 animate-slide-up">
-                  <CheckCircle size={15} className="text-emerald-600 shrink-0 mt-0.5" />
-                  <div className="font-sans text-[11px] leading-relaxed">
-                    <span className="font-semibold">{backupSuccess}</span>
-                  </div>
-                </div>
-              )}
-
-              {backupError && (
-                <div className="rounded-xl border border-rose-200 bg-rose-50/80 p-3 flex gap-2.5 items-start text-rose-800 animate-slide-up">
-                  <AlertCircle size={15} className="text-rose-600 shrink-0 mt-0.5" />
-                  <div className="font-sans text-[11px] leading-relaxed">
-                    <span className="font-semibold">{backupError}</span>
-                  </div>
-                </div>
-              )}
-
-              {/* Section 1: Export Data & Files */}
-              <div className="space-y-4">
-                <span className="block font-sans text-[10px] font-extrabold uppercase tracking-wider text-slate-400">
-                  Step 1: Export / Download Project Files
-                </span>
-                
-                {/* File 1: db.json */}
-                <div className="p-3 bg-slate-50/70 border border-slate-100 rounded-xl space-y-2.5">
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <span className="block font-sans text-xs font-bold text-slate-800 leading-tight">
-                        Database Local Storage (db.json)
-                      </span>
-                      <span className="block font-sans text-[9px] text-slate-400 mt-0.5 leading-normal">
-                        Contains your customized dinner courses, curated grocery items, lists, and timetables.
-                      </span>
-                    </div>
-                    <span className="bg-emerald-100 text-emerald-800 font-sans text-[8px] font-bold px-1.5 py-0.5 rounded-sm uppercase tracking-wider shrink-0">
-                      Data
-                    </span>
-                  </div>
-                  
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      onClick={handleDownloadBackup}
-                      className="bg-emerald-600 hover:bg-emerald-700 text-white font-sans text-[10px] sm:text-xs font-semibold py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 transition cursor-pointer shadow-xs"
-                    >
-                      <Download size={12} />
-                      Download File
-                    </button>
-                    <button
-                      onClick={handleCopyDbToClipboard}
-                      disabled={copyingDb}
-                      className="bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 font-sans text-[10px] sm:text-xs font-semibold py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-50"
-                    >
-                      {copyingDb ? (
-                        <Loader2 size={12} className="animate-spin text-emerald-600" />
-                      ) : (
-                        <Copy size={12} className="text-slate-500" />
-                      )}
-                      {copyingDb ? 'Loading...' : 'Copy Raw JSON'}
-                    </button>
-                  </div>
-                </div>
-
-                {/* File 2: package-lock.json */}
-                <div className="p-3 bg-slate-50/70 border border-slate-100 rounded-xl space-y-2.5">
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <span className="block font-sans text-xs font-bold text-slate-800 leading-tight">
-                        NPM Locks Configuration (package-lock.json)
-                      </span>
-                      <span className="block font-sans text-[9px] text-slate-400 mt-0.5 leading-normal">
-                        Deterministic tree lock outlining standard external production dependencies.
-                      </span>
-                    </div>
-                    <span className="bg-purple-100 text-purple-800 font-sans text-[8px] font-bold px-1.5 py-0.5 rounded-sm uppercase tracking-wider shrink-0">
-                      Config
-                    </span>
-                  </div>
-                  
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      onClick={handleDownloadPackageLock}
-                      className="bg-purple-600 hover:bg-purple-700 text-white font-sans text-[10px] sm:text-xs font-semibold py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 transition cursor-pointer shadow-xs"
-                    >
-                      <Download size={12} />
-                      Download File
-                    </button>
-                    <button
-                      onClick={handleCopyLockToClipboard}
-                      disabled={copyingLock}
-                      className="bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 font-sans text-[10px] sm:text-xs font-semibold py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 transition cursor-pointer disabled:opacity-50"
-                    >
-                      {copyingLock ? (
-                        <Loader2 size={12} className="animate-spin text-purple-600" />
-                      ) : (
-                        <Copy size={12} className="text-slate-500" />
-                      )}
-                      {copyingLock ? 'Loading...' : 'Copy Raw Lock'}
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              {/* Section 2: Import / Restore Data */}
-              <div className="space-y-2 pt-2 border-t border-slate-100">
-                <span className="block font-sans text-[10px] font-extrabold uppercase tracking-wider text-slate-400">
-                  Step 2: Install / Restore Backup
-                </span>
-                
-                {/* Drag and Drop Zone Container */}
-                <div 
-                  onDragEnter={handleDrag}
-                  onDragOver={handleDrag}
-                  onDragLeave={handleDrag}
-                  onDrop={handleDrop}
-                  onClick={() => document.getElementById('db-file-picker')?.click()}
-                  className={`border-2 border-dashed rounded-xl p-6 text-center transition duration-200 cursor-pointer flex flex-col items-center justify-center gap-2 relative overflow-hidden ${
-                    dragActive 
-                      ? 'border-emerald-600 bg-emerald-50/70 scale-[0.99] shadow-xs' 
-                      : 'border-slate-200 hover:border-emerald-500 hover:bg-slate-50/50'
-                  }`}
-                >
-                  <input 
-                    id="db-file-picker"
-                    type="file" 
-                    onChange={handleFileChange}
-                    accept=".json"
-                    className="hidden"
-                  />
-                  <div className={`p-2 rounded-lg ${dragActive ? 'bg-emerald-100' : 'bg-slate-100'} transition duration-200`}>
-                    <FileJson size={18} className={dragActive ? 'text-emerald-700' : 'text-slate-500'} />
-                  </div>
-                  <div>
-                    <span className="block font-sans text-xs font-bold text-slate-700">
-                      {dragActive ? 'Drop your backup file now' : 'Select or drag backup file'}
-                    </span>
-                    <span className="block font-sans text-[10px] text-slate-400 mt-1">
-                      Supports only raw .json files exported from CookBook
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Footer */}
-            <div className="px-5 py-3 border-t border-slate-100 bg-slate-50 flex justify-end">
-              <button
-                onClick={() => setIsBackupModalOpen(false)}
-                className="px-4 py-1.5 bg-white border border-slate-200 hover:bg-slate-100 text-slate-600 rounded-lg font-sans text-xs font-semibold cursor-pointer transition"
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        </div>
       )}
     </div>
   );

@@ -1,0 +1,212 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Reusable Hardened Primitives ---
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidCurrency(currency) {
+      return currency is string && currency.size() <= 10 &&
+        currency in ['USD', 'EUR', 'GBP', 'JPY', 'INR', 'CAD', 'AUD'];
+    }
+
+    function isValidDay(day) {
+      return day is string && day.size() <= 16 &&
+        day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+    }
+
+    function isValidOptionalRecipeId(val) {
+      return val is string && val.size() <= 128 && val.matches('^[a-zA-Z0-9_\\-]*$');
+    }
+
+    // --- Validation Blueprints ---
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['ownerId', 'currency', 'hiddenRecipeIds', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'currency', 'hiddenRecipeIds', 'createdAt', 'updatedAt']) &&
+        data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId) &&
+        isValidCurrency(data.currency) &&
+        data.hiddenRecipeIds is list && data.hiddenRecipeIds.size() <= 500 &&
+        (data.hiddenRecipeIds.size() == 0 || (data.hiddenRecipeIds[0] is string && data.hiddenRecipeIds[0].size() <= 128)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidMealPlan(data, userId, dayParam) {
+      return data.keys().hasAll(['ownerId', 'day', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'day', 'breakfast', 'lunch', 'dinner', 'createdAt', 'updatedAt']) &&
+        data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId) &&
+        isValidDay(data.day) && data.day == dayParam &&
+        (!('breakfast' in data) || isValidOptionalRecipeId(data.breakfast)) &&
+        (!('lunch' in data) || isValidOptionalRecipeId(data.lunch)) &&
+        (!('dinner' in data) || isValidOptionalRecipeId(data.dinner)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidGroceryItem(data, userId) {
+      return data.keys().hasAll(['ownerId', 'itemKey', 'name', 'amount', 'unit', 'checked', 'isCustom', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'itemKey', 'name', 'amount', 'unit', 'checked', 'isCustom', 'createdAt', 'updatedAt']) &&
+        data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId) &&
+        data.itemKey is string && data.itemKey.size() >= 1 && data.itemKey.size() <= 160 &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 160 &&
+        data.amount is string && data.amount.size() <= 40 &&
+        data.unit is string && data.unit.size() <= 40 &&
+        data.checked is bool &&
+        data.isCustom is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidNutriScan(data, userId) {
+      return data.keys().hasAll([
+          'ownerId', 'query', 'mealName', 'isFruitOrVegetable',
+          'calories', 'carbohydrates', 'proteins', 'fats',
+          'vitamins', 'minerals', 'healthScore', 'isUnhealthy',
+          'unhealthyExplanation', 'healthyAlternatives', 'funFact',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId', 'query', 'mealName', 'isFruitOrVegetable',
+          'calories', 'carbohydrates', 'proteins', 'fats',
+          'vitamins', 'minerals', 'healthScore', 'isUnhealthy',
+          'unhealthyExplanation', 'healthyAlternatives', 'funFact',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId) &&
+        data.query is string && data.query.size() >= 1 && data.query.size() <= 200 &&
+        data.mealName is string && data.mealName.size() >= 1 && data.mealName.size() <= 200 &&
+        data.isFruitOrVegetable is bool &&
+        data.calories is string && data.calories.size() <= 40 &&
+        data.carbohydrates is string && data.carbohydrates.size() <= 40 &&
+        data.proteins is string && data.proteins.size() <= 40 &&
+        data.fats is string && data.fats.size() <= 40 &&
+        data.vitamins is list && data.vitamins.size() <= 15 &&
+        (data.vitamins.size() == 0 || (data.vitamins[0] is string && data.vitamins[0].size() <= 120)) &&
+        data.minerals is list && data.minerals.size() <= 15 &&
+        (data.minerals.size() == 0 || (data.minerals[0] is string && data.minerals[0].size() <= 120)) &&
+        (data.healthScore is int || data.healthScore is float) &&
+        data.healthScore >= 0 && data.healthScore <= 100 &&
+        data.isUnhealthy is bool &&
+        data.unhealthyExplanation is string && data.unhealthyExplanation.size() <= 1000 &&
+        data.healthyAlternatives is list && data.healthyAlternatives.size() <= 10 &&
+        (
+          data.healthyAlternatives.size() == 0 ||
+          (
+            data.healthyAlternatives[0] is map &&
+            data.healthyAlternatives[0].keys().hasAll(['name', 'description']) &&
+            data.healthyAlternatives[0].keys().hasOnly(['name', 'description']) &&
+            data.healthyAlternatives[0].name is string && data.healthyAlternatives[0].name.size() <= 200 &&
+            data.healthyAlternatives[0].description is string && data.healthyAlternatives[0].description.size() <= 600
+          )
+        ) &&
+        data.funFact is string && data.funFact.size() <= 1000 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // --- Collection Rules ---
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow list: if false;
+      allow create: if isValidId(userId) && isOwner(userId) &&
+        isValidUserProfile(incoming(), userId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(userId) && isOwner(userId) &&
+        isValidUserProfile(incoming(), userId) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          incoming().diff(existing()).affectedKeys().hasOnly(['currency', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['hiddenRecipeIds', 'updatedAt']) ||
+          incoming().diff(existing()).affectedKeys().hasOnly(['currency', 'hiddenRecipeIds', 'updatedAt'])
+        );
+      allow delete: if isValidId(userId) && isOwner(userId);
+
+      match /mealPlans/{day} {
+        allow get: if isValidId(userId) && isValidDay(day) && isOwner(userId);
+        allow list: if isValidId(userId) && isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidDay(day) && isOwner(userId) &&
+          isValidMealPlan(incoming(), userId, day) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+        allow update: if isValidId(userId) && isValidDay(day) && isOwner(userId) &&
+          isValidMealPlan(incoming(), userId, day) &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().day == existing().day &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['breakfast', 'lunch', 'dinner', 'updatedAt']);
+        allow delete: if isValidId(userId) && isValidDay(day) && isOwner(userId);
+      }
+
+      match /groceryItems/{itemId} {
+        allow get: if isValidId(userId) && isValidId(itemId) && isOwner(userId);
+        allow list: if isValidId(userId) && isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(itemId) && isOwner(userId) &&
+          isValidGroceryItem(incoming(), userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+        allow update: if isValidId(userId) && isValidId(itemId) && isOwner(userId) &&
+          isValidGroceryItem(incoming(), userId) &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().itemKey == existing().itemKey &&
+          incoming().isCustom == existing().isCustom &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            incoming().diff(existing()).affectedKeys().hasOnly(['checked', 'updatedAt']) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['amount', 'unit', 'updatedAt']) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['checked', 'amount', 'unit', 'updatedAt'])
+          );
+        allow delete: if isValidId(userId) && isValidId(itemId) && isOwner(userId);
+      }
+
+      match /nutriScans/{scanId} {
+        allow get: if isValidId(userId) && isValidId(scanId) && isOwner(userId);
+        allow list: if isValidId(userId) && isOwner(userId) && existing().ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(scanId) && isOwner(userId) &&
+          isValidNutriScan(incoming(), userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+        allow update: if isValidId(userId) && isValidId(scanId) && isOwner(userId) &&
+          isValidNutriScan(incoming(), userId) &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().query == existing().query &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'mealName', 'isFruitOrVegetable', 'calories', 'carbohydrates',
+            'proteins', 'fats', 'vitamins', 'minerals', 'healthScore',
+            'isUnhealthy', 'unhealthyExplanation', 'healthyAlternatives',
+            'funFact', 'updatedAt'
+          ]);
+        allow delete: if isValidId(userId) && isValidId(scanId) && isOwner(userId);
+      }
+    }
+  }
+}

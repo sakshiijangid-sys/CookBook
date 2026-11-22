@@ -1,712 +1,476 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
-import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
-import { RecipeModel, MealPlanModel, ProductModel } from './server/db';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+
+const PRIMARY_MODEL = 'gemini-3.1-flash-lite';
+const SECONDARY_MODEL = 'gemini-4-hydrogen';
+
+interface CachedEntry<T> {
+  value: T;
+  expiresAt: number;
+}
+
+const CACHE_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
+const MAX_CACHE_ENTRIES = 500;
+const nutritionCache = new Map<string, CachedEntry<any>>();
+const priceCache = new Map<string, CachedEntry<{ estimatedPriceUSD: number; explanation: string }>>();
+
+function getCached<T>(cache: Map<string, CachedEntry<T>>, key: string): T | null {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    cache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function setCached<T>(cache: Map<string, CachedEntry<T>>, key: string, value: T): void {
+  if (cache.size >= MAX_CACHE_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey !== undefined) cache.delete(oldestKey);
+  }
+  cache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
+}
+
+function getGeminiClient(): GoogleGenAI | null {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+    return null;
+  }
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+function classifyGeminiError(err: unknown): { status: number; message: string } {
+  const apiStatus = typeof (err as { status?: unknown })?.status === 'number'
+    ? (err as { status: number }).status
+    : undefined;
+  const msg = err instanceof Error ? err.message : String(err);
+  const lower = msg.toLowerCase();
+
+  if (apiStatus === 429 || lower.includes('429') || lower.includes('resource_exhausted') || lower.includes('quota')) {
+    return {
+      status: 429,
+      message: 'Free-tier Gemini API quota limit reached. Please wait and try again, or select a billing-enabled API key in Settings > Secrets to increase your quota.',
+    };
+  }
+  if (apiStatus === 403 || lower.includes('403') || lower.includes('permission_denied') || lower.includes('api_key_invalid') || lower.includes('api key')) {
+    return {
+      status: 403,
+      message: 'Gemini API authentication failed. Please verify your GEMINI_API_KEY in Settings > Secrets.',
+    };
+  }
+  if (apiStatus === 503 || lower.includes('503') || lower.includes('unavailable')) {
+    return {
+      status: 503,
+      message: 'Nutrition & pricing AI service is temporarily busy. Please click Retry in a moment.',
+    };
+  }
+  if (apiStatus === 404 || lower.includes('404') || lower.includes('not_found')) {
+    return {
+      status: 502,
+      message: 'Configured Gemini model is unavailable for this API endpoint.',
+    };
+  }
+  if (apiStatus === 400 || lower.includes('invalid_argument')) {
+    return {
+      status: 400,
+      message: `Invalid nutrition/pricing request parameter: ${msg.slice(0, 180)}`,
+    };
+  }
+  return {
+    status: 502,
+    message: `Unable to complete AI analysis right now (${apiStatus ? `HTTP ${apiStatus}` : 'upstream error'}). Please try again shortly.`,
+  };
+}
+
+async function generateWithModelFallback<T>(
+  runner: (model: string, thinkingLevel: ThinkingLevel) => Promise<T>
+): Promise<T> {
+  try {
+    return await runner(PRIMARY_MODEL, ThinkingLevel.MINIMAL);
+  } catch (primaryErr) {
+    const apiStatus = typeof (primaryErr as { status?: unknown })?.status === 'number'
+      ? (primaryErr as { status: number }).status
+      : undefined;
+    const msg = primaryErr instanceof Error ? primaryErr.message.toLowerCase() : String(primaryErr).toLowerCase();
+    const shouldTrySecondary =
+      apiStatus === 429 ||
+      apiStatus === 503 ||
+      apiStatus === 404 ||
+      msg.includes('429') ||
+      msg.includes('resource_exhausted') ||
+      msg.includes('503') ||
+      msg.includes('unavailable');
+
+    if (!shouldTrySecondary) {
+      throw primaryErr;
+    }
+
+    return await runner(SECONDARY_MODEL, ThinkingLevel.LOW);
+  }
+}
+
+function clampPrice(val: unknown): number {
+  const num = typeof val === 'number' ? val : Number(val);
+  if (!Number.isFinite(num) || num <= 0) return 1.99;
+  return Math.round(Math.max(0.15, Math.min(250, num)) * 100) / 100;
+}
+
+function sanitizeString(val: unknown, maxLen: number, fallback = ''): string {
+  if (typeof val !== 'string') return fallback;
+  return val.trim().slice(0, maxLen);
+}
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // Middleware for parsing requests
-  app.use(express.json());
+  app.use(express.json({ limit: '256kb' }));
 
-  // Log incoming API calls for helpful diagnostics
-  app.use((req, res, next) => {
-    console.log(`[API ${new Date().toISOString().slice(11, 19)}] ${req.method} ${req.url}`);
-    next();
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true });
   });
 
-  // --- Express REST API for Products ---
-  
-  app.get('/api/products', async (req, res) => {
-    try {
-      const products = await ProductModel.find();
-      res.json(products);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to fetch products' });
-    }
-  });
-
-  app.post('/api/products', async (req, res) => {
-    try {
-      const { name, price, description, category } = req.body;
-      if (!name || price === undefined) {
-        return res.status(400).json({ error: 'Name and price are required' });
-      }
-      const newProduct = await ProductModel.create({
-        name,
-        price: Number(price),
-        description: description || '',
-        category: category || 'General'
-      });
-      res.status(201).json(newProduct);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to create product' });
-    }
-  });
-
-  app.delete('/api/products/:id', async (req, res) => {
-    try {
-      const success = await ProductModel.findByIdAndDelete(req.params.id);
-      if (!success) {
-        return res.status(404).json({ error: 'Product not found' });
-      }
-      res.json({ message: 'Product successfully deleted' });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to delete product' });
-    }
-  });
-
-  // --- Express REST API for Recipes (utilizing MongoDB-like nested arrays) ---
-
-  app.get('/api/recipes', async (req, res) => {
-    try {
-      const { category, search, tag } = req.query;
-      let recipes = await RecipeModel.find();
-
-      if (category && category !== 'All') {
-        recipes = recipes.filter(r => r.category.toLowerCase() === String(category).toLowerCase());
-      }
-
-      if (tag) {
-        recipes = recipes.filter(r => r.tags.some(t => t.toLowerCase() === String(tag).toLowerCase()));
-      }
-
-      if (search) {
-        const searchTerm = String(search).toLowerCase();
-        recipes = recipes.filter(r => 
-          r.name.toLowerCase().includes(searchTerm) || 
-          r.description.toLowerCase().includes(searchTerm) ||
-          r.ingredients.some(ing => ing.name.toLowerCase().includes(searchTerm)) ||
-          r.tags.some(t => t.toLowerCase().includes(searchTerm))
-        );
-      }
-
-      res.json(recipes);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to fetch recipes' });
-    }
-  });
-
-  app.get('/api/recipes/:id', async (req, res) => {
-    try {
-      const recipe = await RecipeModel.findById(req.params.id);
-      if (!recipe) {
-        return res.status(404).json({ error: 'Recipe not found' });
-      }
-      res.json(recipe);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to fetch recipe' });
-    }
-  });
-
-  app.post('/api/recipes', async (req, res) => {
-    try {
-      const { name, description, image, category, prepTime, cookTime, servings, ingredients, steps, tags, price } = req.body;
-      
-      // Validation matching a solid schema check
-      if (!name || !category || !ingredients || !steps) {
-        return res.status(400).json({ error: 'Missing required recipe fields: name, category, ingredients, and steps are required' });
-      }
-
-      const newRecipe = await RecipeModel.create({
-        name,
-        description: description || '',
-        image: image || 'https://images.unsplash.com/photo-1495521821757-a1efb6729352?w=600&auto=format&fit=crop&q=60',
-        category,
-        prepTime: Number(prepTime) || 0,
-        cookTime: Number(cookTime) || 0,
-        servings: Number(servings) || 1,
-        ingredients: Array.isArray(ingredients) ? ingredients : [],
-        steps: Array.isArray(steps) ? steps : [],
-        tags: Array.isArray(tags) ? tags : [],
-        price: Number(price) || 0
-      });
-
-      res.status(201).json(newRecipe);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to create recipe' });
-    }
-  });
-
-  app.put('/api/recipes/:id', async (req, res) => {
-    try {
-      const updated = await RecipeModel.findByIdAndUpdate(req.params.id, req.body);
-      if (!updated) {
-        return res.status(404).json({ error: 'Recipe not found' });
-      }
-      res.json(updated);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to update recipe' });
-    }
-  });
-
-  app.delete('/api/recipes/:id', async (req, res) => {
-    try {
-      const success = await RecipeModel.findByIdAndDelete(req.params.id);
-      if (!success) {
-        return res.status(404).json({ error: 'Recipe not found' });
-      }
-      res.json({ message: 'Recipe successfully deleted' });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to delete recipe' });
-    }
-  });
-
-  // --- Express REST API for Meal Plans ---
-  app.get('/api/mealplan', async (req, res) => {
-    try {
-      const plan = await MealPlanModel.find();
-      res.json(plan);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to fetch meal plan' });
-    }
-  });
-
-  app.post('/api/mealplan', async (req, res) => {
-    try {
-      const { day, breakfast, lunch, dinner } = req.body;
-      if (!day) {
-        return res.status(400).json({ error: 'Day of week is required' });
-      }
-      const updatedPlan = await MealPlanModel.updatePlan(day, {
-        breakfast: breakfast || undefined,
-        lunch: lunch || undefined,
-        dinner: dinner || undefined
-      });
-      res.json(updatedPlan);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to update meal plan' });
-    }
-  });
-
-  // --- Express REST API for Database Backup & Restore/Import (db.json) ---
-  
-  app.get('/api/backup', async (req, res) => {
-    try {
-      const backupPath = path.join(process.cwd(), 'data', 'db.json');
-      if (!fs.existsSync(backupPath)) {
-        return res.status(404).json({ error: 'Database file not found' });
-      }
-      res.setHeader('Content-Type', 'application/json');
-      res.setHeader('Content-Disposition', 'attachment; filename=db.json');
-      res.sendFile(backupPath);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to download db.json' });
-    }
-  });
-
-  app.get('/api/package-lock', async (req, res) => {
-    try {
-      const lockPath = path.join(process.cwd(), 'package-lock.json');
-      if (!fs.existsSync(lockPath)) {
-        return res.status(404).json({ error: 'package-lock.json file not found' });
-      }
-      res.setHeader('Content-Type', 'application/json');
-      res.setHeader('Content-Disposition', 'attachment; filename=package-lock.json');
-      res.sendFile(lockPath);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to download package-lock.json' });
-    }
-  });
-
-  app.post('/api/backup', async (req, res) => {
-    try {
-      const uploadedData = req.body;
-      if (!uploadedData || typeof uploadedData !== 'object') {
-        return res.status(400).json({ error: 'Invalid file: payload must be a JSON object' });
-      }
-      if (!Array.isArray(uploadedData.recipes)) {
-        return res.status(400).json({ error: 'Invalid backup: "recipes" array is required' });
-      }
-      if (!Array.isArray(uploadedData.mealPlans)) {
-        uploadedData.mealPlans = [];
-      }
-      if (!Array.isArray(uploadedData.products)) {
-        uploadedData.products = [];
-      }
-
-      const backupPath = path.join(process.cwd(), 'data', 'db.json');
-      fs.writeFileSync(backupPath, JSON.stringify(uploadedData, null, 2), 'utf-8');
-      res.json({ message: 'Database successfully imported and restored! Page will reload shortly.' });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to restore database from backup file' });
-    }
-  });
-
-  // --- Helper function for dynamic local grocery price fallback estimates ---
-  function generateLocalFallbackPrice(name: string, quantity: string, unit: string) {
-    const normName = name.toLowerCase().trim();
-    const normUnit = (unit || '').toLowerCase().trim();
-    const qtyNum = parseFloat(quantity) || 1;
-    
-    // Scale quantity dynamically based on units to represent normal supermarket purchase units
-    let scaleFactor = 1;
-    if (['g', 'gram', 'grams', 'gr'].includes(normUnit)) {
-      scaleFactor = 1 / 450; // standard 450g or 1lb package
-    } else if (['ml', 'milliliter', 'milliliters'].includes(normUnit)) {
-      scaleFactor = 1 / 500; // standard 500ml bottle
-    } else if (['tsp', 'tsps', 'teaspoon', 'teaspoons'].includes(normUnit)) {
-      scaleFactor = 1 / 96; // typical jar holds many teaspoons (about 96 tsp)
-    } else if (['tbsp', 'tbsps', 'tablespoon', 'tablespoons'].includes(normUnit)) {
-      scaleFactor = 1 / 32; // typical bottle/jar holds ~32 tablespoons
-    } else if (['oz', 'ounce', 'ounces', 'ozs'].includes(normUnit)) {
-      scaleFactor = 1 / 16; // 16 oz = 1 lb package unit
-    } else if (['kg', 'kilogram', 'kilograms'].includes(normUnit)) {
-      scaleFactor = 2.2; // 1 kg is 2.2 lbs
-    } else if (['pinch', 'pinches', 'dash', 'dashes', 'clove', 'cloves', 'sprig', 'sprigs'].includes(normUnit)) {
-      scaleFactor = 0.05; // tiny fractional item
-    }
-
-    const scaledQty = Math.max(0.1, qtyNum * scaleFactor);
-
-    let basePrice = 1.99;
-    if (normName.includes('lemon') || normName.includes('lime')) {
-      basePrice = 0.60;
-    } else if (normName.includes('egg')) {
-      basePrice = 0.25;
-    } else if (normName.includes('milk') || normName.includes('cream')) {
-      basePrice = 3.29;
-    } else if (normName.includes('sugar') || normName.includes('flour')) {
-      basePrice = 1.49;
-    } else if (normName.includes('butter')) {
-      basePrice = 2.99;
-    } else if (normName.includes('cheese') || normName.includes('mozzarella') || normName.includes('parmesan')) {
-      basePrice = 3.49;
-    } else if (normName.includes('chicken') || normName.includes('beef') || normName.includes('meat') || normName.includes('salmon') || normName.includes('pork') || normName.includes('lamb') || normName.includes('turkey')) {
-      basePrice = 7.99;
-    } else if (normName.includes('onion') || normName.includes('garlic') || normName.includes('ginger') || normName.includes('shallot')) {
-      basePrice = 0.89;
-    } else if (normName.includes('salt') || normName.includes('pepper') || normName.includes('spice') || normName.includes('powder') || normName.includes('herb') || normName.includes('oregano') || normName.includes('cinnamon') || normName.includes('cumin')) {
-      basePrice = 1.89;
-    } else if (normName.includes('oil') || normName.includes('vinegar')) {
-      basePrice = 4.49;
-    } else if (normName.includes('tomato') || normName.includes('potato') || normName.includes('carrot') || normName.includes('cucumber') || normName.includes('celery') || normName.includes('spinach') || normName.includes('lettuce')) {
-      basePrice = 1.29;
-    } else if (normName.includes('rice') || normName.includes('pasta') || normName.includes('noodle') || normName.includes('bread')) {
-      basePrice = 1.69;
-    } else {
-      const charSum = name.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
-      basePrice = 1.20 + (charSum % 250) / 100;
-    }
-
-    let estimatedPriceUSD = Math.round(basePrice * scaledQty * 100) / 100;
-    if (estimatedPriceUSD < 0.15) {
-      estimatedPriceUSD = 0.15; // Set lower bound limit
-    } else if (estimatedPriceUSD > 49.99) {
-      estimatedPriceUSD = 49.99; // Set reasonable upper bound for individual grocery entries
-    }
-
-    return {
-      estimatedPriceUSD,
-      explanation: `Estimated catalog price ($${basePrice.toFixed(2)}/unit scaled to standard supermarket retail package representation).`
-    };
-  }
-
-  // --- Express REST API for Gemini Batch Market Pricing ---
+  // --- Server-Side Gemini Batch Grocery Pricing ---
   app.post('/api/gemini/price/batch', async (req, res) => {
     try {
-      const { items } = req.body;
-      if (!Array.isArray(items) || items.length === 0) {
-        return res.status(400).json({ error: 'Items array is required' });
+      const rawItems = req.body?.items;
+      if (!Array.isArray(rawItems) || rawItems.length === 0) {
+        return res.status(400).json({ error: 'Items array is required.' });
+      }
+      if (rawItems.length > 100) {
+        return res.status(400).json({ error: 'Maximum of 100 items can be priced per batch.' });
       }
 
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (!apiKey) {
-        const results = items.map(item => {
-          const fallback = generateLocalFallbackPrice(item.name, item.quantity, item.unit);
-          return { key: item.key, ...fallback };
-        });
-        return res.json({ items: results });
+      const items = rawItems
+        .map((item: any) => ({
+          key: sanitizeString(item?.key, 160),
+          name: sanitizeString(item?.name, 160),
+          quantity: sanitizeString(item?.quantity, 40, '1') || '1',
+          unit: sanitizeString(item?.unit, 40, 'unit') || 'unit',
+        }))
+        .filter((item) => item.key.length > 0 && item.name.length > 0);
+
+      if (items.length === 0) {
+        return res.status(400).json({ error: 'Valid items with key and name are required.' });
       }
 
-      // Lazy load Gemini SDK
-      const { GoogleGenAI, Type } = await import('@google/genai');
-      const ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          }
+      const cachedHits: { key: string; estimatedPriceUSD: number; explanation: string }[] = [];
+      const uncachedItems: typeof items = [];
+
+      for (const item of items) {
+        const cacheKey = `${item.name.toLowerCase()}|${item.quantity.toLowerCase()}|${item.unit.toLowerCase()}`;
+        const hit = getCached(priceCache, cacheKey);
+        if (hit) {
+          cachedHits.push({ key: item.key, ...hit });
+        } else {
+          uncachedItems.push(item);
         }
-      });
+      }
 
-      const prompt = `Estimate the average retail US grocery store price in USD for each of these items. Use realistic estimates corresponding strictly to their keys.
-CRITICAL QUANTITY SCALING WARNING: Be extremely careful with units! If an item has a quantity like 500 and unit "g" or "grams", do NOT multiply the unit count directly to get hundreds of dollars (e.g. 500g of flour is around $1.50 - $2.50, NOT $100+). If an item is in teaspoons, tablespoons, milliliters, or grams, treat it as a small fraction of a single cheap package or bottle, or estimate the retail cost of a standard bundle/box. Keep prices user-affordable and realistic. Most standard ingredients should cost between $0.20 and $12.00 total.
+      if (uncachedItems.length === 0) {
+        const totalUSD = Math.round(cachedHits.reduce((sum, item) => sum + item.estimatedPriceUSD, 0) * 100) / 100;
+        return res.json({ items: cachedHits, totalUSD });
+      }
+
+      const ai = getGeminiClient();
+      if (!ai) {
+        return res.status(503).json({
+          error: 'Gemini API key is not configured. Add GEMINI_API_KEY in Settings > Secrets.',
+        });
+      }
+
+      const prompt = `Estimate the realistic retail US grocery store price in USD for each of these items. Use realistic estimates corresponding strictly to their keys.
+CRITICAL QUANTITY SCALING: Be careful with units! If an item has a quantity like 500 and unit "g" or "grams", estimate the retail cost for that portion or standard package (e.g. 500g of flour is around $1.50 - $2.50, NOT $100+). If an item is in teaspoons, tablespoons, or milliliters, treat it as a realistic grocery fraction or small pack. Most standard recipe ingredients cost between $0.20 and $15.00.
 
 Items to price:
-${items.map((i, idx) => `${idx + 1}. Key: "${i.key}", Name: "${i.name}", Qty: "${i.quantity}", Unit: "${i.unit}"`).join('\n')}
+${uncachedItems.map((i, idx) => `${idx + 1}. Key: "${i.key}", Name: "${i.name}", Qty: "${i.quantity}", Unit: "${i.unit}"`).join('\n')}`;
 
-Format your response as a JSON object containing an "items" array. Each array element must have:
-- key: string matching the item key exactly.
-- estimatedPriceUSD: number representing average price in USD.
-- explanation: brief explanation text.`;
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.5-flash',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              items: {
-                type: Type.ARRAY,
+      const response = await generateWithModelFallback((model, thinkingLevel) =>
+        ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            thinkingConfig: { thinkingLevel },
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
                 items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    key: { type: Type.STRING },
-                    estimatedPriceUSD: { type: Type.NUMBER },
-                    explanation: { type: Type.STRING }
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      key: { type: Type.STRING },
+                      estimatedPriceUSD: { type: Type.NUMBER },
+                      explanation: { type: Type.STRING },
+                    },
+                    required: ['key', 'estimatedPriceUSD', 'explanation'],
                   },
-                  required: ["key", "estimatedPriceUSD", "explanation"]
-                }
-              }
+                },
+              },
+              required: ['items'],
             },
-            required: ["items"]
-          }
-        }
-      });
+          },
+        })
+      );
 
-      if (response.text) {
-        const result = JSON.parse(response.text.trim());
-        return res.json(result);
-      } else {
-        throw new Error("No response text from Gemini API");
-      }
-    } catch (err: any) {
-      const errStr = String(err);
-      if (errStr.includes('429') || errStr.includes('quota') || errStr.includes('quotaExceeded') || errStr.includes('RESOURCE_EXHAUSTED')) {
-        console.warn('Gemini 429 rate limit hit in batch pricing. Using fallback offline estimates.');
-      } else {
-        console.error('Error in batch pricing:', err);
+      const rawText = response.text?.trim();
+      if (!rawText) {
+        return res.status(502).json({ error: 'Empty response from pricing service.' });
       }
 
-      const { items } = req.body || {};
-      const results = (items || []).map((item: any) => {
-        const fallback = generateLocalFallbackPrice(item.name || 'item', item.quantity || '1', item.unit || '');
-        return { key: item.key, ...fallback };
-      });
-      return res.json({ items: results });
+      const parsed = JSON.parse(rawText);
+      const validKeys = new Set(uncachedItems.map((i) => i.key));
+      const itemByKey = new Map(uncachedItems.map((i) => [i.key, i]));
+
+      const freshPricedItems = Array.isArray(parsed?.items)
+        ? parsed.items
+            .filter((entry: any) => typeof entry?.key === 'string' && validKeys.has(entry.key))
+            .map((entry: any) => {
+              const normalized = {
+                key: entry.key as string,
+                estimatedPriceUSD: clampPrice(entry.estimatedPriceUSD),
+                explanation: sanitizeString(entry.explanation, 300, 'Estimated US retail grocery price.'),
+              };
+              const orig = itemByKey.get(normalized.key);
+              if (orig) {
+                const cacheKey = `${orig.name.toLowerCase()}|${orig.quantity.toLowerCase()}|${orig.unit.toLowerCase()}`;
+                setCached(priceCache, cacheKey, {
+                  estimatedPriceUSD: normalized.estimatedPriceUSD,
+                  explanation: normalized.explanation,
+                });
+              }
+              return normalized;
+            })
+        : [];
+
+      const pricedItems = [...cachedHits, ...freshPricedItems];
+      const totalUSD = Math.round(pricedItems.reduce((sum: number, item: any) => sum + item.estimatedPriceUSD, 0) * 100) / 100;
+      return res.json({ items: pricedItems, totalUSD });
+    } catch (err) {
+      const mapped = classifyGeminiError(err);
+      console.warn(`Batch pricing failed (${mapped.status}): ${mapped.message}`);
+      return res.status(mapped.status).json({ error: mapped.message });
     }
   });
 
-  // --- Express REST API for Gemini Market Pricing ---
+  // --- Server-Side Gemini Single-Item Grocery Pricing ---
   app.post('/api/gemini/price', async (req, res) => {
     try {
-      const { name, quantity, unit } = req.body;
+      const name = sanitizeString(req.body?.name, 160);
+      const quantity = sanitizeString(req.body?.quantity, 40, '1') || '1';
+      const unit = sanitizeString(req.body?.unit, 40, 'unit') || 'unit';
+
       if (!name) {
-        return res.status(400).json({ error: 'Ingredient name is required' });
+        return res.status(400).json({ error: 'Ingredient name is required.' });
       }
 
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (!apiKey) {
-        const fallback = generateLocalFallbackPrice(name, quantity, unit);
-        return res.json(fallback);
+      const cacheKey = `${name.toLowerCase()}|${quantity.toLowerCase()}|${unit.toLowerCase()}`;
+      const cached = getCached(priceCache, cacheKey);
+      if (cached) {
+        return res.json(cached);
       }
 
-      const { GoogleGenAI, Type } = await import('@google/genai');
-      const ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          }
-        }
-      });
+      const ai = getGeminiClient();
+      if (!ai) {
+        return res.status(503).json({
+          error: 'Gemini API key is not configured. Add GEMINI_API_KEY in Settings > Secrets.',
+        });
+      }
 
-      const qtyVal = quantity || '1';
-      const unitVal = unit || 'unit';
-
-      const prompt = `Estimate the realistic retail supermarket price in USD for buying this specific item.
-CRITICAL QUANTITY SCALING WARNING: Be extremely careful with units! If an item has a quantity like 500 and unit "g" or "grams", do NOT multiply the unit count directly to get hundreds of dollars (e.g. 500g of flour is around $1.50 - $2.50, NOT $100+). If an item is in teaspoons, tablespoons, milliliters, or grams, treat it as a small fraction of a single cheap package or bottle, or estimate the retail cost of a standard box/can/pack. Keep prices user-affordable and realistic. Most standard ingredients should cost between $0.20 and $12.00 total.
+      const prompt = `Estimate the realistic retail supermarket price in USD for buying this specific ingredient portion.
+CRITICAL QUANTITY SCALING: Be careful with units (e.g., 500g flour is ~$1.50-$2.50, 1 tbsp oil is ~$0.25). Most ingredients cost between $0.20 and $15.00.
 
 Item: ${name}
-Quantity: ${qtyVal}
-Unit: ${unitVal}
+Quantity: ${quantity}
+Unit: ${unit}`;
 
-Provide your response in JSON format specifying:
-- estimatedPriceUSD: the estimated average grocery store price in USD for this item at a typical US supermarket as a floating number (e.g., 2.99 or 0.75).
-- explanation: a brief one-sentence explanation of how this price was calculated based on general market prices (e.g., "Fresh limes usually cost around $0.50 per piece").`;
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.5-flash',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              estimatedPriceUSD: {
-                type: Type.NUMBER,
-                description: "The calculated price in USD."
+      const response = await generateWithModelFallback((model, thinkingLevel) =>
+        ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            thinkingConfig: { thinkingLevel },
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                estimatedPriceUSD: { type: Type.NUMBER },
+                explanation: { type: Type.STRING },
               },
-              explanation: {
-                type: Type.STRING,
-                description: "Brief reasoning for the price."
-              }
+              required: ['estimatedPriceUSD', 'explanation'],
             },
-            required: ["estimatedPriceUSD", "explanation"]
-          }
-        }
-      });
+          },
+        })
+      );
 
-      if (response.text) {
-        const result = JSON.parse(response.text.trim());
-        res.json(result);
-      } else {
-        throw new Error("No response content from Gemini API");
+      const rawText = response.text?.trim();
+      if (!rawText) {
+        return res.status(502).json({ error: 'Empty response from pricing service.' });
       }
-    } catch (err: any) {
-      const errStr = String(err);
-      if (errStr.includes('429') || errStr.includes('quota') || errStr.includes('quotaExceeded') || errStr.includes('RESOURCE_EXHAUSTED')) {
-        console.warn('Gemini 429 rate limit hit in single-item pricing. Using fallback estimate.');
-      } else {
-        console.error('Error in single-item pricing:', err);
-      }
-      
-      const { name, quantity, unit } = req.body || {};
-      const fallback = generateLocalFallbackPrice(name || 'item', quantity || '1', unit || '');
-      res.json(fallback);
+
+      const parsed = JSON.parse(rawText);
+      const result = {
+        estimatedPriceUSD: clampPrice(parsed?.estimatedPriceUSD),
+        explanation: sanitizeString(parsed?.explanation, 300, 'Estimated US retail grocery price.'),
+      };
+      setCached(priceCache, cacheKey, result);
+      return res.json(result);
+    } catch (err) {
+      const mapped = classifyGeminiError(err);
+      console.warn(`Single item pricing failed (${mapped.status}): ${mapped.message}`);
+      return res.status(mapped.status).json({ error: mapped.message });
     }
   });
 
-  // --- Express REST API for Gemini Nutrition & Health Classifier ---
+  // --- Server-Side Gemini NutriCare Nutrition & Health Classifier ---
   app.post('/api/gemini/nutrition', async (req, res) => {
-    const { mealName } = req.body;
-    if (!mealName) {
-      return res.status(400).json({ error: 'Meal or food name is required' });
-    }
-
-    // Dynamic fallback structure
-    function generateFallbackNutrition(name: string) {
-      const norm = name.toLowerCase().trim();
-      if (norm.includes('apple')) {
-        return {
-          mealName: "Apple (Fresh)",
-          isFruitOrVegetable: true,
-          calories: "95 kcal",
-          carbohydrates: "25g",
-          proteins: "0.5g",
-          fats: "0.3g",
-          vitamins: ["Vitamin C (14% DV)", "Vitamin B6 (5% DV)"],
-          minerals: ["Potassium (6% DV)", "Magnesium (2% DV)"],
-          healthScore: 98,
-          isUnhealthy: false,
-          unhealthyExplanation: "",
-          healthyAlternatives: [],
-          funFact: "Apples contain soluble fiber called pectin, which helps improve gut bacteria and lower cholesterol."
-        };
-      }
-      if (norm.includes('banana')) {
-        return {
-          mealName: "Banana (Fresh)",
-          isFruitOrVegetable: true,
-          calories: "105 kcal",
-          carbohydrates: "27g",
-          proteins: "1.3g",
-          fats: "0.3g",
-          vitamins: ["Vitamin B6 (33% DV)", "Vitamin C (11% DV)"],
-          minerals: ["Potassium (10% DV)", "Magnesium (8% DV)"],
-          healthScore: 92,
-          isUnhealthy: false,
-          unhealthyExplanation: "",
-          healthyAlternatives: [],
-          funFact: "Bananas are harvested green and artificially ripened using ethylene gas right before arriving at your local supermarket."
-        };
-      }
-      if (norm.includes('burger') || norm.includes('cheeseburger')) {
-        return {
-          mealName: "Cheeseburger (Fast Food)",
-          isFruitOrVegetable: false,
-          calories: "535 kcal",
-          carbohydrates: "40g",
-          proteins: "30g",
-          fats: "28g",
-          vitamins: ["Vitamin B12 (35% DV)", "Folate (15% DV)"],
-          minerals: ["Sodium (48% DV)", "Iron (22% DV)", "Calcium (20% DV)"],
-          healthScore: 35,
-          isUnhealthy: true,
-          unhealthyExplanation: "High levels of saturated fats, sodium, and highly refined white-flour buns with processed cheeses.",
-          healthyAlternatives: [
-            { name: "Turkey Burger on Whole Grain Bun", description: "Much leaner meat cut with high fiber whole grains for steady blood sugar." },
-            { name: "Grilled Chicken Breast Wrap", description: "Significantly lower saturated fat with solid lean protein punch." },
-            { name: "Black Bean Quinoa Burger", description: "A high-fiber, completely plant-based alternative with heart-healthy proteins." }
-          ],
-          funFact: "The average fast-food cheeseburger often exceeds half your daily recommended maximum sodium intake in a single serving."
-        };
-      }
-      if (norm.includes('pizza')) {
-        return {
-          mealName: "Pepperoni Pizza (Slice)",
-          isFruitOrVegetable: false,
-          calories: "290 kcal",
-          carbohydrates: "32g",
-          proteins: "12g",
-          fats: "12g",
-          vitamins: ["Thiamin (15% DV)", "Riboflavin (12% DV)"],
-          minerals: ["Sodium (30% DV)", "Calcium (15% DV)"],
-          healthScore: 42,
-          isUnhealthy: true,
-          unhealthyExplanation: "Rich in processed meats containing harmful nitrites, refined wheat crust, and elevated sodium.",
-          healthyAlternatives: [
-            { name: "Cauliflower Crust Veggie Pizza", description: "Lowers total carb load significantly while magnifying dietary fiber." },
-            { name: "Whole Wheat Margherita Pizza", description: "Offers complex carbs and healthier fats from fresh mozzarella and olive oil." }
-          ],
-          funFact: "Tomato sauce on pizza is high in lycopene, a powerful antioxidant that is actually more easily absorbed after cooking!"
-        };
-      }
-      if (norm.includes('salad')) {
-        return {
-          mealName: "Mixed Garden Salad",
-          isFruitOrVegetable: true,
-          calories: "140 kcal",
-          carbohydrates: "8g",
-          proteins: "3g",
-          fats: "11g",
-          vitamins: ["Vitamin A (80% DV)", "Vitamin K (150% DV)", "Vitamin C (25% DV)"],
-          minerals: ["Folate (15% DV)", "Iron (6% DV)"],
-          healthScore: 95,
-          isUnhealthy: false,
-          unhealthyExplanation: "",
-          healthyAlternatives: [],
-          funFact: "Adding healthy fats like olive oil or avocado to your salad dramatically increases your body's absorption of fat-soluble vitamins (A, D, E, K) from the leafy greens."
-        };
-      }
-
-      // General fallback computation
-      const isHealthy = !norm.includes('fry') && !norm.includes('candy') && !norm.includes('cake') && !norm.includes('donut') && !norm.includes('soda') && !norm.includes('fried') && !norm.includes('chips') && !norm.includes('cookie') && !norm.includes('ice cream');
-      const score = isHealthy ? Math.min(95, 65 + (name.length % 30)) : Math.max(15, 20 + (name.length % 25));
-      
-      return {
-        mealName: name.charAt(0).toUpperCase() + name.slice(1),
-        isFruitOrVegetable: norm.includes('vegetable') || norm.includes('fruit') || norm.includes('pear') || norm.includes('orange') || norm.includes('carrot') || norm.includes('cucumber') || norm.includes('broccoli') || norm.includes('berry') || norm.includes('spinach') || norm.includes('tomato'),
-        calories: `${120 + (name.length % 5) * 60} kcal`,
-        carbohydrates: `${15 + (name.length % 7) * 8}g`,
-        proteins: `${5 + (name.length % 9) * 4}g`,
-        fats: `${2 + (name.length % 6) * 3}g`,
-        vitamins: ["Vitamin C (12% DV)", "Vitamin A (10% DV)"],
-        minerals: ["Calcium (4% DV)", "Iron (6% DV)"],
-        healthScore: score,
-        isUnhealthy: !isHealthy,
-        unhealthyExplanation: isHealthy ? "" : "Contains high levels of refined ingredients, saturated/trans fats, or simple sugars.",
-        healthyAlternatives: isHealthy ? [] : [
-          { name: `Baked Protein-Rich ${name.charAt(0).toUpperCase() + name.slice(1)} Substitute`, description: "Uses natural fiber substitutions, low glycogen binders, and healthy spice grilling." },
-          { name: "Organic Veggies with Hummus Dip", description: "Provides excellent raw micronutrients and complex heart-healthy carbohydrates." }
-        ],
-        funFact: "Dynamic food logging and nutritional awareness helps build sustainable eating habits and controls blood sugar spikes!"
-      };
-    }
-
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      console.log(`[Nutrition] Offline Mode fallback calculations for: "${mealName}"`);
-      return res.json(generateFallbackNutrition(mealName));
-    }
-
     try {
-      const { GoogleGenAI, Type } = await import('@google/genai');
-      const ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: {
-          headers: {
-            'User-Agent': 'aistudio-build',
-          }
-        }
-      });
+      const mealName = sanitizeString(req.body?.mealName, 200);
+      if (!mealName) {
+        return res.status(400).json({ error: 'A valid meal or food name (up to 200 characters) is required.' });
+      }
 
-      const prompt = `Perform a realistic nutritional and health analysis of the following food, meal, fruit or vegetable: "${mealName}".
-Determine its macro nutrients (calories, carbs, proteins, fats), significant vitamins, minerals, and whether it qualifies primarily as a fruit or vegetable.
-Additionally, calculate a descriptive Health Score from 1 to 100 (where 90-100 is highly nutritious, and under 50 suggests unhealthy profiles).
-If the item is unhealthy, flag "isUnhealthy": true, explain briefly in unhealthyExplanation, and recommend 2-3 specific healthy alternatives. Otherwise flag "isUnhealthy": false.
+      const cacheKey = mealName.toLowerCase();
+      const cached = getCached(nutritionCache, cacheKey);
+      if (cached) {
+        return res.json(cached);
+      }
 
-Structure your response strictly as JSON with this exact schema:
-{
-  "mealName": string (normalized elegant name),
-  "isFruitOrVegetable": boolean,
-  "calories": string (e.g., "150 kcal"),
-  "carbohydrates": string (e.g., "25g"),
-  "proteins": string (e.g., "3g"),
-  "fats": string (e.g., "2g"),
-  "vitamins": array of strings (list 2-4 key vitamins, with percentages if known, e.g., ["Vitamin C (15%)", "Vitamin A"]),
-  "minerals": array of strings (list 1-3 key minerals, e.g., ["Zinc (4%)", "Iron"]),
-  "healthScore": integer (1 to 100),
-  "isUnhealthy": boolean,
-  "unhealthyExplanation": string (if isUnhealthy is true, explain why, otherwise empty string),
-  "healthyAlternatives": array of objects, where each object has:
-     - "name": string
-     - "description": string
-  "funFact": string (a short, exciting scientific or cooking fact about this food's nutrition)
-}`;
+      const ai = getGeminiClient();
+      if (!ai) {
+        return res.status(503).json({
+          error: 'Gemini API key is not configured. Add GEMINI_API_KEY in Settings > Secrets to run NutriCare scans.',
+        });
+      }
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.5-flash',
-        contents: prompt,
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              mealName: { type: Type.STRING },
-              isFruitOrVegetable: { type: Type.BOOLEAN },
-              calories: { type: Type.STRING },
-              carbohydrates: { type: Type.STRING },
-              proteins: { type: Type.STRING },
-              fats: { type: Type.STRING },
-              vitamins: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING }
-              },
-              minerals: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING }
-              },
-              healthScore: { type: Type.INTEGER },
-              isUnhealthy: { type: Type.BOOLEAN },
-              unhealthyExplanation: { type: Type.STRING },
-              healthyAlternatives: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    name: { type: Type.STRING },
-                    description: { type: Type.STRING }
+      const prompt = `Perform an accurate, realistic nutritional and health analysis for a standard single serving of the following food, meal, fruit, or vegetable: "${mealName}".
+Determine its macronutrients (calories, carbohydrates, proteins, fats), significant vitamins, essential minerals, and whether it is primarily a whole fruit or vegetable.
+Calculate a realistic Health Score from 0 to 100 (where 80-100 is nutrient-dense whole food, 50-79 is moderate, and under 50 indicates ultra-processed, high sodium, high added sugar, or high saturated fat).
+If healthScore < 60 or the item has notable dietary risks, set "isUnhealthy": true, explain concisely in "unhealthyExplanation", and recommend 2-3 specific healthier alternatives. Otherwise set "isUnhealthy": false with an empty "unhealthyExplanation" and empty "healthyAlternatives" array.
+Provide one concise, accurate scientific or culinary nutrition "funFact".`;
+
+      const response = await generateWithModelFallback((model, thinkingLevel) =>
+        ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            thinkingConfig: { thinkingLevel },
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                mealName: { type: Type.STRING },
+                isFruitOrVegetable: { type: Type.BOOLEAN },
+                calories: { type: Type.STRING },
+                carbohydrates: { type: Type.STRING },
+                proteins: { type: Type.STRING },
+                fats: { type: Type.STRING },
+                vitamins: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                },
+                minerals: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                },
+                healthScore: { type: Type.INTEGER },
+                isUnhealthy: { type: Type.BOOLEAN },
+                unhealthyExplanation: { type: Type.STRING },
+                healthyAlternatives: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      name: { type: Type.STRING },
+                      description: { type: Type.STRING },
+                    },
+                    required: ['name', 'description'],
                   },
-                  required: ["name", "description"]
-                }
+                },
+                funFact: { type: Type.STRING },
               },
-              funFact: { type: Type.STRING }
+              required: [
+                'mealName',
+                'isFruitOrVegetable',
+                'calories',
+                'carbohydrates',
+                'proteins',
+                'fats',
+                'vitamins',
+                'minerals',
+                'healthScore',
+                'isUnhealthy',
+                'unhealthyExplanation',
+                'healthyAlternatives',
+                'funFact',
+              ],
             },
-            required: [
-              "mealName", "isFruitOrVegetable", "calories", "carbohydrates", 
-              "proteins", "fats", "vitamins", "minerals", "healthScore", 
-              "isUnhealthy", "unhealthyExplanation", "healthyAlternatives", "funFact"
-            ]
-          }
-        }
-      });
+          },
+        })
+      );
 
-      if (response.text) {
-        const result = JSON.parse(response.text.trim());
-        return res.json(result);
-      } else {
-        throw new Error("Empty response from Gemini API");
+      const rawText = response.text?.trim();
+      if (!rawText) {
+        return res.status(502).json({ error: 'Empty response from nutrition engine.' });
       }
-    } catch (err: any) {
-      const errStr = String(err);
-      if (errStr.includes('429') || errStr.includes('quota') || errStr.includes('quotaExceeded') || errStr.includes('RESOURCE_EXHAUSTED')) {
-        console.warn('Gemini 429 rate limit hit in nutrition analysis. Using fallback offline calculations.');
-      } else {
-        console.error('Error generating nutrition content:', err);
-      }
-      // Fallback gracefully on rate limits or API downtime
-      return res.json(generateFallbackNutrition(mealName));
+
+      const parsed = JSON.parse(rawText);
+      const rawScore = Number(parsed?.healthScore);
+      const healthScore = Number.isFinite(rawScore)
+        ? Math.max(0, Math.min(100, Math.round(rawScore)))
+        : 50;
+
+      const normalized = {
+        mealName: sanitizeString(parsed?.mealName, 200, mealName) || mealName,
+        isFruitOrVegetable: Boolean(parsed?.isFruitOrVegetable),
+        calories: sanitizeString(parsed?.calories, 40, 'N/A') || 'N/A',
+        carbohydrates: sanitizeString(parsed?.carbohydrates, 40, 'N/A') || 'N/A',
+        proteins: sanitizeString(parsed?.proteins, 40, 'N/A') || 'N/A',
+        fats: sanitizeString(parsed?.fats, 40, 'N/A') || 'N/A',
+        vitamins: Array.isArray(parsed?.vitamins)
+          ? parsed.vitamins.map((v: unknown) => sanitizeString(v, 120)).filter(Boolean).slice(0, 15)
+          : [],
+        minerals: Array.isArray(parsed?.minerals)
+          ? parsed.minerals.map((m: unknown) => sanitizeString(m, 120)).filter(Boolean).slice(0, 15)
+          : [],
+        healthScore,
+        isUnhealthy: Boolean(parsed?.isUnhealthy),
+        unhealthyExplanation: sanitizeString(parsed?.unhealthyExplanation, 1000),
+        healthyAlternatives: Array.isArray(parsed?.healthyAlternatives)
+          ? parsed.healthyAlternatives
+              .filter((alt: any) => alt && typeof alt.name === 'string' && typeof alt.description === 'string')
+              .map((alt: any) => ({
+                name: sanitizeString(alt.name, 200),
+                description: sanitizeString(alt.description, 600),
+              }))
+              .filter((alt: any) => alt.name.length > 0 && alt.description.length > 0)
+              .slice(0, 10)
+          : [],
+        funFact: sanitizeString(parsed?.funFact, 1000),
+      };
+
+      setCached(nutritionCache, cacheKey, normalized);
+      return res.json(normalized);
+    } catch (err) {
+      const mapped = classifyGeminiError(err);
+      console.warn(`Nutrition analysis failed (${mapped.status}): ${mapped.message}`);
+      return res.status(mapped.status).json({ error: mapped.message });
     }
   });
 
   // --- Vite Dev Middleware and Production Static Files ---
-  
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -716,17 +480,16 @@ Structure your response strictly as JSON with this exact schema:
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    // Support SPA router fallback on '*' for Express v4
-    app.get('*', (req, res) => {
+    app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Recipe Server] Running at http://0.0.0.0:${PORT}`);
+    console.log(`[CookBook Server] Running at http://0.0.0.0:${PORT}`);
   });
 }
 
 startServer().catch((err) => {
-  console.error("Critical server failure on startup:", err);
+  console.error('Critical server failure on startup:', err);
 });
