@@ -8,6 +8,14 @@ export interface Ingredient {
   unit: string;
 }
 
+export interface Product {
+  _id: string;
+  name: string;
+  price: number;
+  description: string;
+  category: string;
+}
+
 export interface Recipe {
   _id: string;
   name: string;
