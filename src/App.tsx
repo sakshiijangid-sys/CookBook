@@ -22,7 +22,6 @@ import {
   ChefHat,
   Utensils,
   Heart,
-  RotateCcw,
 } from 'lucide-react';
 
 function makeSafeDocId(prefix: string, rawKey: string): string {
@@ -56,7 +55,6 @@ const VALID_DAYS: DayOfWeek[] = [
 
 interface PersistedWorkspace {
   currency: CurrencyType;
-  hiddenRecipeIds: string[];
   mealPlans: MealPlan[];
   groceryRecords: Record<string, GroceryItemRecord>;
   nutriScans: NutriScanRecord[];
@@ -65,7 +63,6 @@ interface PersistedWorkspace {
 function loadWorkspaceFromStorage(): PersistedWorkspace {
   const defaults: PersistedWorkspace = {
     currency: 'USD',
-    hiddenRecipeIds: [],
     mealPlans: DEFAULT_MEAL_PLANS,
     groceryRecords: {},
     nutriScans: [],
@@ -80,10 +77,6 @@ function loadWorkspaceFromStorage(): PersistedWorkspace {
     const currency = VALID_CURRENCIES.includes(parsed.currency)
       ? (parsed.currency as CurrencyType)
       : 'USD';
-
-    const hiddenRecipeIds = Array.isArray(parsed.hiddenRecipeIds)
-      ? parsed.hiddenRecipeIds.filter((id: unknown): id is string => typeof id === 'string').slice(0, 500)
-      : [];
 
     const mealPlans: MealPlan[] = Array.isArray(parsed.mealPlans)
       ? parsed.mealPlans
@@ -138,7 +131,6 @@ function loadWorkspaceFromStorage(): PersistedWorkspace {
 
     return {
       currency,
-      hiddenRecipeIds,
       mealPlans: mealPlans.length > 0 ? mealPlans : DEFAULT_MEAL_PLANS,
       groceryRecords,
       nutriScans,
@@ -155,7 +147,6 @@ export default function App() {
 
   // Workspace preferences & state (no sign-in required; prices stay strictly in session memory)
   const [currency, setCurrencyState] = useState<CurrencyType>(initialWorkspace.currency);
-  const [hiddenRecipeIds, setHiddenRecipeIds] = useState<string[]>(initialWorkspace.hiddenRecipeIds);
   const [mealPlans, setMealPlans] = useState<MealPlan[]>(initialWorkspace.mealPlans);
   const [groceryRecords, setGroceryRecords] = useState<Record<string, GroceryItemRecord>>(
     initialWorkspace.groceryRecords
@@ -199,7 +190,6 @@ export default function App() {
     try {
       const payload: PersistedWorkspace = {
         currency,
-        hiddenRecipeIds,
         mealPlans,
         groceryRecords,
         nutriScans,
@@ -208,20 +198,15 @@ export default function App() {
     } catch {
       // Ignore storage quota or private-mode restrictions
     }
-  }, [currency, hiddenRecipeIds, mealPlans, groceryRecords, nutriScans]);
+  }, [currency, mealPlans, groceryRecords, nutriScans]);
 
   useEffect(() => {
     setVisibleCount(24);
   }, [selectedCategory, searchTerm, selectedTag]);
 
-  const visibleRecipes = useMemo(() => {
-    const hiddenSet = new Set(hiddenRecipeIds);
-    return CURATED_RECIPES.filter((r) => !hiddenSet.has(r._id));
-  }, [hiddenRecipeIds]);
-
   const filteredRecipes = useMemo(() => {
     const q = searchTerm.toLowerCase();
-    return visibleRecipes.filter((recipe) => {
+    return CURATED_RECIPES.filter((recipe) => {
       const matchesSearch =
         !q ||
         recipe.name.toLowerCase().includes(q) ||
@@ -233,33 +218,16 @@ export default function App() {
         !selectedTag || recipe.tags.some((t) => t.toLowerCase() === selectedTag.toLowerCase());
       return matchesSearch && matchesCategory && matchesTag;
     });
-  }, [visibleRecipes, searchTerm, selectedCategory, selectedTag]);
+  }, [searchTerm, selectedCategory, selectedTag]);
 
   const uniqueTags = useMemo(
-    () => Array.from(new Set(visibleRecipes.flatMap((r) => r.tags || []).map((t) => t.trim()))).sort(),
-    [visibleRecipes]
+    () => Array.from(new Set(CURATED_RECIPES.flatMap((r) => r.tags || []).map((t) => t.trim()))).sort(),
+    []
   );
 
   // Handlers
   const handleSetCurrency = (nextCurrency: CurrencyType) => {
     setCurrencyState(nextCurrency);
-  };
-
-  const handleHideRecipe = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    setHiddenRecipeIds((prev) => Array.from(new Set([...prev, id])).slice(0, 500));
-    setMealPlans((prev) =>
-      prev.map((p) => ({
-        ...p,
-        breakfast: p.breakfast === id ? undefined : p.breakfast,
-        lunch: p.lunch === id ? undefined : p.lunch,
-        dinner: p.dinner === id ? undefined : p.dinner,
-      }))
-    );
-  };
-
-  const handleRestoreHiddenRecipes = () => {
-    setHiddenRecipeIds([]);
   };
 
   const handleUpdateMeal = async (
@@ -499,16 +467,6 @@ export default function App() {
                       {filteredRecipes.length} Recipes Available
                     </p>
                   </div>
-                  {hiddenRecipeIds.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={handleRestoreHiddenRecipes}
-                      className="inline-flex items-center gap-1 text-[10px] font-semibold text-emerald-700 bg-white border border-emerald-200 px-2.5 py-1 rounded-lg hover:bg-emerald-50 transition cursor-pointer"
-                    >
-                      <RotateCcw size={11} />
-                      Restore ({hiddenRecipeIds.length})
-                    </button>
-                  )}
                 </div>
                 <p className="font-sans text-xs text-slate-500 leading-relaxed">
                   Tap any recipe to view ingredients, step-by-step instructions, or run an instant NutriCare breakdown.
@@ -539,7 +497,6 @@ export default function App() {
                       currency={currency}
                       exchangeRates={exchangeRates}
                       onSelect={setSelectedRecipe}
-                      onHide={handleHideRecipe}
                     />
                   ))}
                 </div>
@@ -561,7 +518,7 @@ export default function App() {
 
         {activeTab === 'planner' && (
           <MealPlannerView
-            recipes={visibleRecipes}
+            recipes={CURATED_RECIPES}
             mealPlans={mealPlans}
             currency={currency}
             exchangeRates={exchangeRates}
@@ -572,7 +529,7 @@ export default function App() {
 
         {activeTab === 'shopping' && (
           <ShoppingListView
-            recipes={visibleRecipes}
+            recipes={CURATED_RECIPES}
             mealPlans={mealPlans}
             groceryRecords={groceryRecords}
             prices={groceryPrices}

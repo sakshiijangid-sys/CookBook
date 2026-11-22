@@ -1,14 +1,13 @@
 import React from 'react';
 import { Recipe } from '../types';
 import { CurrencyType, FALLBACK_RATES, formatPrice } from '../utils/currency';
-import { Clock, Users, Flame, Tag, BookOpen, EyeOff } from 'lucide-react';
+import { Clock, Users, Flame, Tag, BookOpen } from 'lucide-react';
 
 interface RecipeCardProps {
   recipe: Recipe;
   currency?: CurrencyType;
   exchangeRates?: Record<string, number>;
   onSelect: (recipe: Recipe) => void;
-  onHide?: (id: string, e: React.MouseEvent<Element>) => void | Promise<void>;
 }
 
 function RecipeCard({
@@ -16,7 +15,6 @@ function RecipeCard({
   currency = 'USD',
   exchangeRates = FALLBACK_RATES,
   onSelect,
-  onHide,
 }: RecipeCardProps) {
   const { name, description, image, category, prepTime, cookTime, servings, price, tags } = recipe;
 
@@ -60,20 +58,6 @@ function RecipeCard({
           <h3 className="font-sans text-base font-bold tracking-tight text-slate-800 group-hover:text-emerald-600 transition-colors duration-200">
             {name}
           </h3>
-          {onHide && (
-            <button
-              id={`hide-recipe-${recipe._id}`}
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onHide(recipe._id, e);
-              }}
-              className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-rose-500 transition-colors duration-150 shrink-0 cursor-pointer"
-              title="Hide recipe from cookbook"
-            >
-              <EyeOff size={14} />
-            </button>
-          )}
         </div>
 
         <p className="mb-4 h-10 line-clamp-2 font-sans text-xs text-slate-500 leading-relaxed">
